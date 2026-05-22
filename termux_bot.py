@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-TradoWix Pure WebSocket Bot  v3
-================================
-100% WebSocket only — NO REST API at all.
+TradoWix Bot  v4  — REST history + WS live, zero gap
+======================================================
+Exact same strategy as the production chart server:
 
-How it works:
-  - User requests /EURUSD → bot subscribes EURUSD on WS
-  - Live ticks arrive → TickAggregator builds candles minute by minute
-  - Current open candle (is_closed=False) is ALWAYS the latest minute
-  - Zero gap — because everything is built from real live ticks
-  - Data grows over time as bot runs
-
-Limitation vs REST: no 200-candle history on first start.
-Advantage: zero lag, zero gap, latest candle 100% accurate.
+  1. REST  → 200 historical candles (fresh every request, cache-busted)
+  2. WS    → collects live ticks, builds closed candles to FILL the REST lag gap
+  3. WS    → current open candle  (the "missing" latest minute)
+  4. Merge → REST + gap-fill closed candles + open candle = complete, no gap
 
 Install:
     pip install websockets
@@ -22,27 +17,32 @@ Run:
     python termux_bot.py
 
 Endpoints:
-    /EURUSD              all candles collected so far + live current
+    /EURUSD              200 historical + live latest candle
     /EURUSD?limit=50     last 50 candles
-    /EURUSD-OTC          any OTC pair
-    /status              bot status
-    /pairs               all 116 available pairs
-    /tick/EURUSD         latest price + timestamp
+    /EURUSD-OTC          OTC pair (REST lag ~10-40 min, WS fills gap over time)
+    /status              connection + subscription info
+    /pairs               all available pairs
+    /tick/EURUSD         latest live price
 """
 
 from __future__ import annotations
-import asyncio, json, logging, os, time, urllib.parse
-from dataclasses import dataclass, field
+import asyncio, json, logging, os, time, urllib.parse, urllib.request
+from dataclasses import dataclass
 from typing import Optional
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 
 TOKEN = os.environ.get("TRADOWIX_TOKEN", "")
-WS_URL = "wss://api.tradowix.com/ws"
-PORT   = int(os.environ.get("PORT", "8765"))
+WS_URL   = "wss://api.tradowix.com/ws"
+REST_URL = "https://tradowix.com/api/chart/candles"
+PORT     = int(os.environ.get("PORT", "8765"))
+TICK_WAIT_SEC   = 6.0    # wait this long for first WS tick when subscribing
+MAX_WS_CANDLES  = 180    # keep at most N closed candles per pair from WS
 
-# Seconds to wait for first tick after subscribing
-TICK_WAIT = 6.0
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,49 +51,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ── Candle model ─────────────────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Candle:
     symbol: str
-    tf:     int          # timeframe minutes
-    t:      float        # open_time ms
+    tf_sec: int
+    t:      float    # open_time ms
     o:      float
     h:      float
     l:      float
     c:      float
-    vol:    int          # tick count
     closed: bool
 
     def to_dict(self) -> dict:
         return {
-            "symbol":            self.symbol,
-            "timeframe_minutes": self.tf,
-            "open_time":         int(self.t),
-            "close_time":        int(self.t + self.tf * 60_000),
-            "open":              round(self.o, 10),
-            "high":              round(self.h, 10),
-            "low":               round(self.l, 10),
-            "close":             round(self.c, 10),
-            "volume":            self.vol,
-            "is_closed":         self.closed,
+            "symbol":      self.symbol,
+            "timeframe":   self.tf_sec,
+            "open_time":   int(self.t),
+            "close_time":  int(self.t + self.tf_sec * 1000),
+            "datetime_utc": _fmt_utc(self.t),
+            "open":        round(self.o, 10),
+            "high":        round(self.h, 10),
+            "low":         round(self.l, 10),
+            "close":       round(self.c, 10),
+            "is_closed":   self.closed,
         }
+
+
+def _fmt_utc(ts_ms: float) -> str:
+    import datetime
+    return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ── Tick Aggregator ───────────────────────────────────────────────────────────
 
 class Agg:
     """
-    Feeds on raw price ticks, emits closed Candles, always has a live candle.
-    This is the ONLY data source — pure WebSocket ticks.
+    Feeds on live WS ticks → builds closed + open candles.
+    Closed candles are used to fill the REST lag gap.
+    Open candle is the always-live current minute.
     """
 
-    def __init__(self, sym: str, tf: int = 1):
-        self.sym      = sym
-        self.tf       = tf
-        self._ms      = tf * 60_000
-        self._cur:    Optional[Candle] = None
-        self.history: list[Candle]     = []   # closed candles, oldest first
-        self.since:   float            = time.time()
+    def __init__(self, sym: str, tf_sec: int = 60):
+        self.sym    = sym
+        self.tf_sec = tf_sec
+        self._ms    = tf_sec * 1000
+        self._cur:  Optional[Candle] = None
+        self.closed: list[Candle]    = []   # newest at end
 
     def _period(self, ts: float) -> float:
         return (ts // self._ms) * self._ms
@@ -102,63 +107,139 @@ class Agg:
         p = self._period(ts)
 
         if self._cur is None:
-            # First tick ever for this pair
-            self._cur = Candle(self.sym, self.tf, p, price, price, price, price, 1, False)
-            log.info("First tick %-20s @ %.5f  minute=%s", self.sym, price,
-                     _fmt(p))
+            self._cur = Candle(self.sym, self.tf_sec, p, price, price, price, price, False)
 
         elif p > self._cur.t:
-            # Minute rolled over — close current, start new
+            # Minute rolled — archive current as closed
             self._cur.closed = True
-            self.history.append(self._cur)
-            log.debug("Candle closed  %-20s  %s  O=%.5f H=%.5f L=%.5f C=%.5f  ticks=%d",
-                      self.sym, _fmt(self._cur.t),
-                      self._cur.o, self._cur.h, self._cur.l, self._cur.c, self._cur.vol)
-            self._cur = Candle(self.sym, self.tf, p, price, price, price, price, 1, False)
+            self.closed.append(self._cur)
+            if len(self.closed) > MAX_WS_CANDLES:
+                self.closed.pop(0)
+            self._cur = Candle(self.sym, self.tf_sec, p, price, price, price, price, False)
 
         else:
-            # Same minute — update OHLCV
-            self._cur.h   = max(self._cur.h, price)
-            self._cur.l   = min(self._cur.l, price)
-            self._cur.c   = price
-            self._cur.vol += 1
+            self._cur.h = max(self._cur.h, price)
+            self._cur.l = min(self._cur.l, price)
+            self._cur.c = price
 
     @property
-    def live(self) -> Optional[Candle]:
-        """Current open candle — the latest minute, always fresh."""
+    def open_candle(self) -> Optional[Candle]:
+        """Current (live) candle — is_closed=False, latest minute."""
         return self._cur
 
-    def all_candles(self, limit: int = 500) -> list[Candle]:
-        """Closed history + current open. Sorted oldest → newest."""
-        result = list(self.history)
-        if self._cur:
-            result.append(self._cur)
-        return result[-limit:]
+
+# ── REST fetch ────────────────────────────────────────────────────────────────
+
+def _rest_sync(sym: str, count: int) -> list[Candle]:
+    """Blocking REST fetch — runs in executor. Always cache-busted."""
+    params = urllib.parse.urlencode({
+        "symbol":    sym,
+        "timeframe": 60,
+        "count":     count,
+        "_t":        int(time.time() * 1000),   # cache buster
+    })
+    req = urllib.request.Request(
+        f"{REST_URL}?{params}",
+        headers={
+            "User-Agent":    UA,
+            "Cookie":        f"session-token={TOKEN}; oauth_session_token={TOKEN}",
+            "Accept":        "application/json",
+            "Referer":       "https://tradowix.com/trading",
+            "Cache-Control": "no-cache, no-store",
+            "Pragma":        "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = json.loads(r.read())
+
+    now_ms = time.time() * 1000
+    out: list[Candle] = []
+    for d in body.get("candles", []):
+        t = float(d["t"])
+        # isClosed fix: if candle period hasn't ended yet, it's still open
+        is_closed = bool(d.get("isClosed", True)) if (t + 60_000 <= now_ms) else False
+        out.append(Candle(
+            symbol=d.get("symbol", sym),
+            tf_sec=int(d.get("timeframe", 60)),
+            t=t,
+            o=float(d["o"]), h=float(d["h"]),
+            l=float(d["l"]), c=float(d["c"]),
+            closed=is_closed,
+        ))
+
+    out.sort(key=lambda c: c.t)
+    return out
 
 
-def _fmt(ts_ms: float) -> str:
-    import datetime
-    return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%H:%M")
+async def fetch_rest(sym: str, count: int = 200) -> list[Candle]:
+    loop = asyncio.get_event_loop()
+    candles = await loop.run_in_executor(None, _rest_sync, sym, count)
+    log.info("REST %-22s %d candles", sym, len(candles))
+    return candles
 
 
-# ── Bot State ─────────────────────────────────────────────────────────────────
+# ── Merge logic ───────────────────────────────────────────────────────────────
+
+def merge(rest: list[Candle], agg: Optional[Agg], limit: int) -> list[dict]:
+    """
+    Merge REST history + WS gap-fill + WS open candle.
+
+    REST is the base (200 historical candles).
+    WS closed candles newer than last REST candle fill the REST lag gap.
+    WS open candle (current minute) is always appended last.
+    """
+    cmap: dict[float, Candle] = {}
+
+    # 1. REST history as base
+    for c in rest:
+        cmap[c.t] = c
+
+    latest_rest_t = rest[-1].t if rest else 0
+
+    if agg:
+        # 2. WS closed candles → fill gap (only those NEWER than last REST candle)
+        for c in agg.closed:
+            if c.t > latest_rest_t:
+                cmap[c.t] = c   # WS overwrites REST if same timestamp
+
+        # 3. WS open candle — always the latest minute, is_closed=False
+        oc = agg.open_candle
+        if oc:
+            if oc.t in cmap:
+                # Merge: keep REST OHLC but update close + is_closed from WS
+                existing = cmap[oc.t]
+                cmap[oc.t] = Candle(
+                    symbol=existing.symbol, tf_sec=existing.tf_sec, t=existing.t,
+                    o=existing.o,
+                    h=max(existing.h, oc.h),
+                    l=min(existing.l, oc.l),
+                    c=oc.c,
+                    closed=False,
+                )
+            else:
+                cmap[oc.t] = oc
+
+    sorted_c = sorted(cmap.values(), key=lambda c: c.t)
+    return [c.to_dict() for c in sorted_c[-limit:]]
+
+
+# ── Bot state ─────────────────────────────────────────────────────────────────
 
 class Bot:
     def __init__(self):
-        self.aggs:         dict[str, Agg]  = {}   # sym → Agg
-        self.ticks:        dict[str, dict] = {}   # sym → last tick info
-        self.pairs:        list[str]       = []   # all instruments
-        self.active_sym:   Optional[str]   = None
-        self.ws                            = None
-        self.connected                     = False
-        self.status                        = "starting"
-        self.started_at                    = time.time()
+        self.aggs:       dict[str, Agg]  = {}
+        self.ticks:      dict[str, dict] = {}
+        self.pairs:      list[str]       = []
+        self.subscribed: set[str]        = set()   # currently subscribed pairs
+        self.active_sym: Optional[str]   = None    # last subscribed (WS activeSymbol)
 
-        # fires when a tick arrives for the active symbol
-        self._tick_event = asyncio.Event()
-        self._sub_lock   = asyncio.Lock()
+        self.ws           = None
+        self.connected    = False
+        self.status       = "starting"
+        self.started_at   = time.time()
 
-    # ── WebSocket helpers ────────────────────────────────────────────────────
+        self._tick_event  = asyncio.Event()
+        self._sub_lock    = asyncio.Lock()
 
     async def _send(self, data: dict) -> None:
         if self.ws:
@@ -168,24 +249,27 @@ class Bot:
                 log.warning("WS send error: %s", e)
 
     async def subscribe(self, sym: str) -> None:
-        """Subscribe to sym — makes it the active streaming pair."""
+        """Subscribe to sym on WS. WS streams ONE pair at a time (activeSymbol)."""
         async with self._sub_lock:
             if self.active_sym == sym:
                 return
-            log.info("Subscribe → %s", sym)
+            log.info("WS subscribe → %s", sym)
             self.active_sym = sym
+            self.subscribed.add(sym)
             self._tick_event.clear()
+            if sym not in self.aggs:
+                self.aggs[sym] = Agg(sym)
             await self._send({"type": "subscribe", "symbols": [sym], "timeframe": 1})
 
-    async def wait_tick(self, sym: str, timeout: float = TICK_WAIT) -> bool:
-        """Subscribe to sym and wait for at least one tick. Returns True if got tick."""
+    async def wait_tick(self, sym: str, timeout: float = TICK_WAIT_SEC) -> bool:
+        """Subscribe + wait for at least one fresh tick. Returns True if got tick."""
         await self.subscribe(sym)
 
-        # Already have a fresh live candle for this minute?
+        # Already have a reasonably fresh open candle?
         agg = self.aggs.get(sym)
-        if agg and agg.live:
-            now_p = (time.time() * 1000 // 60_000) * 60_000
-            if agg.live.t >= now_p - 60_000:   # within last 1 minute
+        if agg and agg.open_candle:
+            age_ms = time.time() * 1000 - agg.open_candle.t
+            if age_ms < 120_000:   # less than 2 minutes old → good enough
                 return True
 
         self._tick_event.clear()
@@ -200,23 +284,13 @@ class Bot:
         if sym not in self.aggs:
             self.aggs[sym] = Agg(sym)
         self.aggs[sym].feed(price, ts)
-        self.ticks[sym] = {
-            "symbol": sym,
-            "price":  price,
-            "ts_ms":  int(ts),
-            "time":   _fmt(ts),
-        }
+        self.ticks[sym] = {"symbol": sym, "price": price, "ts_ms": int(ts),
+                           "time": _fmt_utc(ts)}
         if sym == self.active_sym:
             self._tick_event.set()
 
-    def candles(self, sym: str, limit: int = 200) -> list[dict]:
-        agg = self.aggs.get(sym)
-        if not agg:
-            return []
-        return [c.to_dict() for c in agg.all_candles(limit=limit)]
 
-
-# ── WebSocket Loop ────────────────────────────────────────────────────────────
+# ── WebSocket loop ────────────────────────────────────────────────────────────
 
 async def ws_loop(bot: Bot) -> None:
     import websockets
@@ -263,10 +337,10 @@ async def ws_loop(bot: Bot) -> None:
                         log.info("Instruments: %d open pairs", len(bot.pairs))
 
                     elif t == "subscribed":
-                        d      = msg.get("data", {})
-                        active = d.get("activeSymbol", "")
-                        ok     = d.get("subscribed", [])
-                        log.info("Active: %s  ok=%s  failed=%s", active, ok, d.get("failed", []))
+                        d = msg.get("data", {})
+                        log.info("Active: %s  ok=%s  failed=%s",
+                                 d.get("activeSymbol"), d.get("subscribed", []),
+                                 d.get("failed", []))
 
                     elif t == "quote":
                         d   = msg.get("data", msg)
@@ -280,7 +354,7 @@ async def ws_loop(bot: Bot) -> None:
                         await ws.send(json.dumps({"type": "pong"}))
 
                     elif t == "error":
-                        log.error("Server error: %s", (msg.get("data") or {}).get("error", msg))
+                        log.error("Server: %s", (msg.get("data") or {}).get("error", msg))
 
         except ConnectionClosed as e:
             log.warning("Disconnected: %s — retry in 3s", e)
@@ -294,29 +368,19 @@ async def ws_loop(bot: Bot) -> None:
         await asyncio.sleep(3)
 
 
-# ── HTTP Server ───────────────────────────────────────────────────────────────
+# ── HTTP Server ────────────────────────────────────────────────────────────────
 
-# Paths that browsers auto-request — ignore silently
-_IGNORE = {"/FAVICON.ICO", "/ROBOTS.TXT", "/APPLE-TOUCH-ICON.PNG",
-           "/APPLE-TOUCH-ICON-PRECOMPOSED.PNG", "/SITEMAP.XML", "/.WELL-KNOWN"}
+_BROWSER_JUNK = {
+    "/FAVICON.ICO", "/ROBOTS.TXT", "/SITEMAP.XML",
+    "/APPLE-TOUCH-ICON.PNG", "/APPLE-TOUCH-ICON-PRECOMPOSED.PNG",
+    "/MANIFEST.JSON", "/.WELL-KNOWN",
+}
 
 
-def _ok(data) -> bytes:
+def _resp(data, status: int = 200) -> bytes:
     body = json.dumps(data, ensure_ascii=False).encode()
     head = (
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode()
-    return head + body
-
-
-def _err(msg: str, code: int = 400) -> bytes:
-    body = json.dumps({"error": msg}).encode()
-    head = (
-        f"HTTP/1.1 {code} Error\r\n"
+        f"HTTP/1.1 {status} {'OK' if status == 200 else 'Error'}\r\n"
         "Content-Type: application/json\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         f"Content-Length: {len(body)}\r\n"
@@ -342,78 +406,97 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         qs     = urllib.parse.parse_qs(parsed.query)
         limit  = int(qs.get("limit", ["200"])[0])
 
-        # Silently ignore browser junk
-        if path in _IGNORE or path.startswith("/."):
+        # Silently ignore browser auto-requests
+        if path in _BROWSER_JUNK or path.startswith("/."):
             writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
 
-        # ── Routes ──────────────────────────────────────────────────────────
-
+        # ── /STATUS ────────────────────────────────────────────────────────
         if path in ("/STATUS", "/", ""):
-            import datetime
             data = {
                 "connected":    bot.connected,
                 "status":       bot.status,
                 "active_pair":  bot.active_sym,
                 "pairs_total":  len(bot.pairs),
-                "pairs_live":   len(bot.aggs),
+                "ws_pairs":     len(bot.aggs),
                 "uptime_sec":   round(time.time() - bot.started_at, 1),
-                "note":         "Pure WebSocket — data builds up as bot runs. No REST lag.",
-                "usage":        "GET /EURUSD  /EURUSD-OTC  /BTCUSD-OTC  etc.",
+                "usage":        "GET /<PAIR>  e.g. /EURUSD  /EURUSD-OTC  /BTCUSD-OTC",
             }
 
+        # ── /PAIRS ─────────────────────────────────────────────────────────
         elif path == "/PAIRS":
             data = {"count": len(bot.pairs), "pairs": sorted(bot.pairs)}
 
+        # ── /TICK/<SYM> ────────────────────────────────────────────────────
         elif path.startswith("/TICK/"):
-            sym = path[6:]
+            sym  = path[6:]
             tick = bot.ticks.get(sym)
             if not tick:
-                got = await bot.wait_tick(sym, timeout=TICK_WAIT)
+                await bot.wait_tick(sym, timeout=TICK_WAIT_SEC)
                 tick = bot.ticks.get(sym)
-            data = tick if tick else {"error": f"No tick for {sym} yet. Is it a valid pair?"}
+            data = tick if tick else {"error": f"No tick for {sym}. Check /pairs"}
 
+        # ── /<SYMBOL> ──────────────────────────────────────────────────────
         else:
             sym = path.lstrip("/")
             if not sym:
-                writer.write(_err("Pair name required. e.g. /EURUSD"))
+                writer.write(_resp({"error": "Pair required. e.g. /EURUSD"}, 400))
                 await writer.drain()
                 return
 
-            # Subscribe and wait for first tick (fast if already active)
-            got_tick = await bot.wait_tick(sym, timeout=TICK_WAIT)
+            # Run REST fetch + WS subscribe concurrently for speed
+            rest_task = asyncio.create_task(fetch_rest(sym, count=200))
+            ws_task   = asyncio.create_task(bot.wait_tick(sym, timeout=TICK_WAIT_SEC))
+            rest_candles, got_tick = await asyncio.gather(
+                rest_task, ws_task, return_exceptions=False
+            )
 
-            candles = bot.candles(sym, limit=limit)
-
-            if not candles and not got_tick:
-                writer.write(_err(
-                    f"No data for '{sym}' within {TICK_WAIT}s. "
-                    f"Check /pairs for valid symbols.", 404
-                ))
+            if not rest_candles and not got_tick:
+                writer.write(_resp({
+                    "error": f"No data for '{sym}'. Check /pairs for valid symbols."
+                }, 404))
                 await writer.drain()
                 return
 
             agg     = bot.aggs.get(sym)
-            live    = agg.live if agg else None
-            since   = agg.since if agg else time.time()
+            candles = merge(rest_candles, agg, limit=limit)
 
-            import datetime
+            # Gap analysis
+            rest_last_t = rest_candles[-1].t if rest_candles else 0
+            ws_open_t   = agg.open_candle.t  if (agg and agg.open_candle) else 0
+            ws_closed_n = len([c for c in (agg.closed if agg else []) if c.t > rest_last_t])
+            gap_min     = round((ws_open_t - rest_last_t) / 60_000) if (rest_last_t and ws_open_t) else None
+
+            if gap_min is not None and gap_min <= 1:
+                verdict = "NO GAP ✅"
+            elif ws_closed_n > 0:
+                verdict = f"GAP PARTIALLY FILLED ✅ ({ws_closed_n} WS candles bridging REST lag)"
+            elif not got_tick:
+                verdict = "WAITING FOR WS TICK ⏳"
+            else:
+                verdict = f"GAP {gap_min}min ⚠️ — shrinks as bot collects more WS candles"
+
             data = {
-                "symbol":         sym,
-                "count":          len(candles),
-                "source":         "WebSocket only — zero lag, zero gap",
-                "collecting_since": datetime.datetime.utcfromtimestamp(since).strftime("%H:%M:%S UTC"),
-                "live_candle":    live.to_dict() if live else None,
-                "gap":            "NONE ✅  (pure WS ticks, current minute always included)",
-                "candles":        candles,
+                "symbol":       sym,
+                "count":        len(candles),
+                "rest_candles": len(rest_candles),
+                "ws_closed":    len(agg.closed) if agg else 0,
+                "gap_status":   verdict,
+                "latest_candle": candles[-1] if candles else None,
+                "candles":      candles,
             }
 
-        writer.write(_ok(data))
+        writer.write(_resp(data))
         await writer.drain()
 
     except Exception as e:
         log.debug("HTTP error: %s", e)
+        try:
+            writer.write(_resp({"error": "Internal error"}, 500))
+            await writer.drain()
+        except Exception:
+            pass
     finally:
         try:
             writer.close()
@@ -426,7 +509,7 @@ async def http_server(bot: Bot) -> None:
         lambda r, w: handle(r, w, bot),
         "0.0.0.0", PORT,
     )
-    log.info("HTTP API → http://localhost:%d", PORT)
+    log.info("HTTP → http://localhost:%d", PORT)
     async with server:
         await server.serve_forever()
 
@@ -435,34 +518,30 @@ async def http_server(bot: Bot) -> None:
 
 async def main() -> None:
     if not TOKEN:
-        print("=" * 52)
-        print("  ERROR: TRADOWIX_TOKEN not set!")
+        print("ERROR: TRADOWIX_TOKEN not set!")
         print("  export TRADOWIX_TOKEN='your_session_token'")
-        print("=" * 52)
         return
 
     bot = Bot()
 
     print("=" * 52)
-    print("  TradoWix Pure WS Bot  v3")
+    print("  TradoWix Bot  v4")
     print(f"  API → http://localhost:{PORT}")
     print()
-    print("  /status       — connection info")
-    print("  /pairs        — all 116 pairs")
-    print("  /EURUSD       — live candles (no gap)")
-    print("  /EURUSD-OTC   — OTC pair")
-    print("  /BTCUSD-OTC   — crypto")
-    print("  /tick/EURUSD  — latest price")
+    print("  /EURUSD          200 history + live latest")
+    print("  /EURUSD-OTC      OTC pair")
+    print("  /BTCUSD-OTC      crypto")
+    print("  /EURUSD?limit=50 last 50 candles")
+    print("  /tick/EURUSD     live price")
+    print("  /status          bot info")
+    print("  /pairs           all 116 pairs")
     print("=" * 52)
 
-    await asyncio.gather(
-        http_server(bot),
-        ws_loop(bot),
-    )
+    await asyncio.gather(http_server(bot), ws_loop(bot))
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nBot stopped.")
+        print("\nStopped.")
