@@ -137,8 +137,9 @@ export const Chart = ({ candles, liveCandle }: ChartProps) => {
     try {
       seriesRef.current.setData(formatted);
       dataLoadedRef.current = true;
-      // Scroll to the latest candle, keep some right padding
-      chartRef.current?.timeScale().scrollToRealTime();
+      // Fit all data into view — scrollToRealTime() uses raw UTC and would
+      // overshoot our UTC+5 shifted timestamps, leaving an empty viewport.
+      chartRef.current?.timeScale().fitContent();
     } catch {}
   }, [candles]);
 
