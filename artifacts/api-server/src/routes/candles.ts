@@ -5,8 +5,7 @@ import type { Candle } from "../lib/tick-aggregator.js";
 const router: IRouter = Router();
 
 const TRADOWIX_BASE = "https://tradowix.com/api/chart/candles";
-const TIMEFRAME_SEC = 60;
-const TIMEFRAME_MS = TIMEFRAME_SEC * 1000;
+const DEFAULT_TIMEFRAME_SEC = 60;
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -27,11 +26,13 @@ function toUtc5String(ms: number): string {
 async function fetchHistoricalCandles(
   symbol: string,
   token: string,
+  timeframeSec: number,
+  count: number,
 ): Promise<Candle[]> {
   const cacheBust = Date.now();
   const url =
     `${TRADOWIX_BASE}?symbol=${encodeURIComponent(symbol)}` +
-    `&timeframe=${TIMEFRAME_SEC}&count=500&_t=${cacheBust}`;
+    `&timeframe=${timeframeSec}&count=${count}&_t=${cacheBust}`;
 
   const res = await fetch(url, {
     headers: {
@@ -57,7 +58,7 @@ async function fetchHistoricalCandles(
 function enrichCandle(candle: Candle): Record<string, unknown> {
   return {
     symbol: candle.symbol,
-    timeframe: TIMEFRAME_SEC,
+    timeframe: candle.timeframe,
     t: candle.t,
     datetime_utc: toUtcString(candle.t),
     datetime_utc5: toUtc5String(candle.t),
@@ -77,6 +78,13 @@ router.get("/candles", async (req: Request, res: Response) => {
     return;
   }
 
+  const rawCount = parseInt((req.query["count"] as string | undefined) ?? "500", 10);
+  const count = isNaN(rawCount) || rawCount < 1 ? 500 : Math.min(rawCount, 1000);
+
+  const rawTf = parseInt((req.query["timeframe"] as string | undefined) ?? String(DEFAULT_TIMEFRAME_SEC), 10);
+  const timeframeSec = isNaN(rawTf) || rawTf < 1 ? DEFAULT_TIMEFRAME_SEC : rawTf;
+  const timeframeMs = timeframeSec * 1000;
+
   const token = process.env["TRADOWIX_TOKEN"] ?? "";
   if (!token) {
     res.status(500).json({ error: "TRADOWIX_TOKEN not configured on server" });
@@ -89,7 +97,7 @@ router.get("/candles", async (req: Request, res: Response) => {
   let fetchError: string | null = null;
 
   try {
-    restCandles = await fetchHistoricalCandles(symbol, token);
+    restCandles = await fetchHistoricalCandles(symbol, token, timeframeSec, count);
   } catch (err: unknown) {
     fetchError = err instanceof Error ? err.message : String(err);
     req.log.warn({ symbol, err: fetchError }, "Historical candle fetch failed");
@@ -140,13 +148,13 @@ router.get("/candles", async (req: Request, res: Response) => {
   if (allTs.length >= 2) {
     const first = allTs[0];
     const last = allTs[allTs.length - 1];
-    for (let t = first; t <= last; t += TIMEFRAME_MS) {
+    for (let t = first; t <= last; t += timeframeMs) {
       if (!candleMap.has(t)) {
-        const prev = candleMap.get(t - TIMEFRAME_MS);
+        const prev = candleMap.get(t - timeframeMs);
         if (prev) {
           candleMap.set(t, {
             symbol,
-            timeframe: TIMEFRAME_SEC,
+            timeframe: timeframeSec,
             t,
             o: prev.c,
             h: prev.c,
@@ -174,10 +182,15 @@ router.get("/candles", async (req: Request, res: Response) => {
     "Candles assembled",
   );
 
+  const tfLabel =
+    timeframeSec < 60 ? `${timeframeSec}s`
+    : timeframeSec < 3600 ? `${timeframeSec / 60}m`
+    : `${timeframeSec / 3600}h`;
+
   res.json({
     symbol,
-    timeframe: TIMEFRAME_SEC,
-    timeframe_label: "1m",
+    timeframe: timeframeSec,
+    timeframe_label: tfLabel,
     count: enriched.length,
     oldest_t: enriched.length > 0 ? enriched[0]["t"] : null,
     latest_t: enriched.length > 0 ? enriched[enriched.length - 1]["t"] : null,
