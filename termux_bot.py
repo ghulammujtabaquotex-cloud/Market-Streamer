@@ -66,22 +66,18 @@ class Candle:
 
     def to_dict(self) -> dict:
         return {
-            "symbol":      self.symbol,
-            "timeframe":   self.tf_sec,
-            "open_time":   int(self.t),
-            "close_time":  int(self.t + self.tf_sec * 1000),
-            "datetime_utc": _fmt_utc(self.t),
-            "open":        round(self.o, 10),
-            "high":        round(self.h, 10),
-            "low":         round(self.l, 10),
-            "close":       round(self.c, 10),
-            "is_closed":   self.closed,
+            "time":  _fmt_utc5(self.t),
+            "open":  round(self.o, 10),
+            "high":  round(self.h, 10),
+            "low":   round(self.l, 10),
+            "close": round(self.c, 10),
         }
 
 
-def _fmt_utc(ts_ms: float) -> str:
+def _fmt_utc5(ts_ms: float) -> str:
     import datetime
-    return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    utc5 = datetime.datetime.utcfromtimestamp(ts_ms / 1000) + datetime.timedelta(hours=5)
+    return utc5.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ── Tick Aggregator ───────────────────────────────────────────────────────────
@@ -262,15 +258,13 @@ class Bot:
             await self._send({"type": "subscribe", "symbols": [sym], "timeframe": 1})
 
     async def wait_tick(self, sym: str, timeout: float = TICK_WAIT_SEC) -> bool:
-        """Subscribe + wait for at least one fresh tick. Returns True if got tick."""
+        """Subscribe + wait for first tick. If we already have ANY tick data, use it immediately."""
         await self.subscribe(sym)
 
-        # Already have a reasonably fresh open candle?
+        # Already have an open candle from previous ticks? Use it — don't wait.
         agg = self.aggs.get(sym)
         if agg and agg.open_candle:
-            age_ms = time.time() * 1000 - agg.open_candle.t
-            if age_ms < 120_000:   # less than 2 minutes old → good enough
-                return True
+            return True
 
         self._tick_event.clear()
         try:
@@ -285,7 +279,7 @@ class Bot:
             self.aggs[sym] = Agg(sym)
         self.aggs[sym].feed(price, ts)
         self.ticks[sym] = {"symbol": sym, "price": price, "ts_ms": int(ts),
-                           "time": _fmt_utc(ts)}
+                           "time": _fmt_utc5(ts)}
         if sym == self.active_sym:
             self._tick_event.set()
 
