@@ -41,7 +41,7 @@ async function fetchHistoricalCandles(
       Accept: "application/json",
       Referer: "https://tradowix.com/trading",
       "Cache-Control": "no-cache, no-store",
-      "Pragma": "no-cache",
+      Pragma: "no-cache",
     },
     cache: "no-store",
     signal: AbortSignal.timeout(15_000),
@@ -81,9 +81,11 @@ router.get("/candles", async (req: Request, res: Response) => {
   const rawCount = parseInt((req.query["count"] as string | undefined) ?? "500", 10);
   const count = isNaN(rawCount) || rawCount < 1 ? 500 : Math.min(rawCount, 1000);
 
-  const rawTf = parseInt((req.query["timeframe"] as string | undefined) ?? String(DEFAULT_TIMEFRAME_SEC), 10);
+  const rawTf = parseInt(
+    (req.query["timeframe"] as string | undefined) ?? String(DEFAULT_TIMEFRAME_SEC),
+    10,
+  );
   const timeframeSec = isNaN(rawTf) || rawTf < 1 ? DEFAULT_TIMEFRAME_SEC : rawTf;
-  const timeframeMs = timeframeSec * 1000;
 
   const token = process.env["TRADOWIX_TOKEN"] ?? "";
   if (!token) {
@@ -91,8 +93,7 @@ router.get("/candles", async (req: Request, res: Response) => {
     return;
   }
 
-  tradowixWs.subscribe(symbol);
-
+  // ── Fetch fresh historical candles from TradoWix REST ──────────────────────
   let restCandles: Candle[] = [];
   let fetchError: string | null = null;
 
@@ -103,30 +104,15 @@ router.get("/candles", async (req: Request, res: Response) => {
     req.log.warn({ symbol, err: fetchError }, "Historical candle fetch failed");
   }
 
-  const wsClosedCandles = tradowixWs.getClosedCandles(symbol);
-  const openCandle = tradowixWs.getOpenCandle(symbol);
-
+  // ── Build candle map from REST data (source of truth) ─────────────────────
   const candleMap = new Map<number, Candle>();
-
   for (const c of restCandles) {
     candleMap.set(c.t, c);
   }
 
-  for (const c of wsClosedCandles) {
-    const existing = candleMap.get(c.t);
-    if (!existing) {
-      candleMap.set(c.t, c);
-    } else {
-      candleMap.set(c.t, {
-        ...existing,
-        h: Math.max(existing.h, c.h),
-        l: Math.min(existing.l, c.l),
-        c: c.c,
-        isClosed: true,
-      });
-    }
-  }
-
+  // ── Merge current open candle from live WS aggregator (if subscribed) ─────
+  // Only merges if the symbol is actively watched by a frontend WS client.
+  const openCandle = tradowixWs.getOpenCandle(symbol);
   if (openCandle) {
     const existing = candleMap.get(openCandle.t);
     if (!existing) {
@@ -142,50 +128,27 @@ router.get("/candles", async (req: Request, res: Response) => {
     }
   }
 
-  const sortedTs = [...candleMap.keys()].sort((a, b) => a - b);
+  // ── Sort and enrich ────────────────────────────────────────────────────────
+  const sorted = [...candleMap.values()].sort((a, b) => a.t - b.t);
+  const enriched = sorted.map(enrichCandle);
 
-  const allTs = sortedTs.length > 1 ? sortedTs : [];
-  if (allTs.length >= 2) {
-    const first = allTs[0];
-    const last = allTs[allTs.length - 1];
-    for (let t = first; t <= last; t += timeframeMs) {
-      if (!candleMap.has(t)) {
-        const prev = candleMap.get(t - timeframeMs);
-        if (prev) {
-          candleMap.set(t, {
-            symbol,
-            timeframe: timeframeSec,
-            t,
-            o: prev.c,
-            h: prev.c,
-            l: prev.c,
-            c: prev.c,
-            isClosed: t < (openCandle?.t ?? Infinity),
-          });
-        }
-      }
-    }
-  }
-
-  const finalTs = [...candleMap.keys()].sort((a, b) => a - b);
-  const candles = finalTs.map((t) => candleMap.get(t)!);
-  const enriched = candles.map(enrichCandle);
+  const tfLabel =
+    timeframeSec < 60
+      ? `${timeframeSec}s`
+      : timeframeSec < 3600
+        ? `${timeframeSec / 60}m`
+        : `${timeframeSec / 3600}h`;
 
   req.log.info(
     {
       symbol,
       total: enriched.length,
       restCount: restCandles.length,
-      wsClosedCount: wsClosedCandles.length,
-      hasOpen: openCandle !== null,
+      hasLiveCandle: openCandle !== null,
+      timeframe: tfLabel,
     },
     "Candles assembled",
   );
-
-  const tfLabel =
-    timeframeSec < 60 ? `${timeframeSec}s`
-    : timeframeSec < 3600 ? `${timeframeSec / 60}m`
-    : `${timeframeSec / 3600}h`;
 
   res.json({
     symbol,

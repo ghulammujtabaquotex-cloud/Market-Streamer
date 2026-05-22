@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { createChart, ColorType } from "lightweight-charts";
+import { createChart, ColorType, CrosshairMode } from "lightweight-charts";
 import type { Candle } from "@workspace/api-client-react";
 
 export interface LiveCandleData {
@@ -16,34 +16,57 @@ export interface ChartProps {
   liveCandle?: LiveCandleData | null;
 }
 
+// TradoWix shows UTC+5 times — shift candle timestamps for display
 const UTC5_SHIFT_SEC = 5 * 3600;
 
 function toChartTime(ms: number) {
   return (Math.floor(ms / 1000) + UTC5_SHIFT_SEC) as unknown as import("lightweight-charts").Time;
 }
 
+function candleColor(c: number, o: number, isLive = false) {
+  const bull = isLive ? "#00e5b3" : "#26a69a";
+  const bear = isLive ? "#ff5c7a" : "#ef5350";
+  return c >= o ? bull : bear;
+}
+
 export const Chart = ({ candles, liveCandle }: ChartProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const seriesRef = useRef<ReturnType<ReturnType<typeof createChart>["addCandlestickSeries"]> | null>(null);
-  const lastInitTs = useRef<number>(0);
+  // Track whether we've done the initial setData so liveCandle updates are safe
+  const dataLoadedRef = useRef(false);
+  // Track the last candle timestamp we set — to avoid redundant full reloads
+  const lastDataKeyRef = useRef<string>("");
 
+  // ── Create chart instance once ──────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
 
     const chart = createChart(containerRef.current, {
+      autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
         textColor: "#8b95a1",
+        fontSize: 11,
       },
       grid: {
-        vertLines: { color: "#151d2b" },
-        horzLines: { color: "#151d2b" },
+        vertLines: { color: "#0f1923" },
+        horzLines: { color: "#0f1923" },
+      },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: { color: "#2d4a6e", labelBackgroundColor: "#1e2a3a", width: 1 },
+        horzLine: { color: "#2d4a6e", labelBackgroundColor: "#1e2a3a", width: 1 },
       },
       timeScale: {
         timeVisible: true,
         secondsVisible: false,
-        borderColor: "#1e2a3a",
+        borderColor: "#1a2535",
+        rightOffset: 10,
+        barSpacing: 8,
+        minBarSpacing: 2,
+        fixLeftEdge: false,
+        fixRightEdge: false,
         tickMarkFormatter: (time: number) => {
           const d = new Date(time * 1000);
           const h = String(d.getUTCHours()).padStart(2, "0");
@@ -55,23 +78,20 @@ export const Chart = ({ candles, liveCandle }: ChartProps) => {
         timeFormatter: (time: number) => {
           const d = new Date(time * 1000);
           const Y = d.getUTCFullYear();
-          const M = String(d.getUTCMonth() + 1).padStart(2, "0");
+          const Mo = String(d.getUTCMonth() + 1).padStart(2, "0");
           const D = String(d.getUTCDate()).padStart(2, "0");
           const h = String(d.getUTCHours()).padStart(2, "0");
           const m = String(d.getUTCMinutes()).padStart(2, "0");
-          return `${Y}-${M}-${D} ${h}:${m} UTC+5`;
+          return `${Y}-${Mo}-${D} ${h}:${m} (UTC+5)`;
         },
       },
       rightPriceScale: {
-        borderColor: "#1e2a3a",
-        scaleMargins: { top: 0.08, bottom: 0.08 },
+        borderColor: "#1a2535",
+        scaleMargins: { top: 0.06, bottom: 0.06 },
+        minimumWidth: 70,
       },
-      crosshair: {
-        vertLine: { color: "#334155", labelBackgroundColor: "#1e2a3a" },
-        horzLine: { color: "#334155", labelBackgroundColor: "#1e2a3a" },
-      },
-      width: containerRef.current.clientWidth,
-      height: containerRef.current.clientHeight,
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
+      handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
     });
     chartRef.current = chart;
 
@@ -84,66 +104,58 @@ export const Chart = ({ candles, liveCandle }: ChartProps) => {
     });
     seriesRef.current = series;
 
-    const observer = new ResizeObserver(() => {
-      if (chartRef.current && containerRef.current) {
-        chartRef.current.applyOptions({
-          width: containerRef.current.clientWidth,
-          height: containerRef.current.clientHeight,
-        });
-      }
-    });
-    observer.observe(containerRef.current);
-
     return () => {
-      observer.disconnect();
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
-      lastInitTs.current = 0;
+      dataLoadedRef.current = false;
+      lastDataKeyRef.current = "";
     };
   }, []);
 
+  // ── Load / refresh full candle dataset ────────────────────────────────────
   useEffect(() => {
     if (!seriesRef.current || !candles || candles.length === 0) return;
 
-    const latestTs = candles[candles.length - 1].t;
+    // Build a lightweight key from first+last timestamp to detect real data changes
+    const first = candles[0].t;
+    const last = candles[candles.length - 1].t;
+    const key = `${first}-${last}-${candles.length}`;
+    if (key === lastDataKeyRef.current) return; // same data, skip
+    lastDataKeyRef.current = key;
 
-    const shouldInit =
-      lastInitTs.current === 0 ||
-      latestTs > lastInitTs.current + 90_000;
-
-    if (!shouldInit) return;
-
-    lastInitTs.current = latestTs;
-
-    const formatted = candles
-      .map((c) => ({
-        time: toChartTime(c.t),
-        open: c.o,
-        high: c.h,
-        low: c.l,
-        close: c.c,
-        color: !c.isClosed ? (c.c >= c.o ? "#00e5b3" : "#ff5c7a") : undefined,
-        wickColor: !c.isClosed ? (c.c >= c.o ? "#00e5b3" : "#ff5c7a") : undefined,
-      }))
-      .sort((a, b) => (a.time as number) - (b.time as number));
-
-    seriesRef.current.setData(formatted);
-    chartRef.current?.timeScale().fitContent();
-  }, [candles]);
-
-  useEffect(() => {
-    if (!seriesRef.current || !liveCandle || lastInitTs.current === 0) return;
+    const formatted = candles.map((c) => ({
+      time: toChartTime(c.t),
+      open: c.o,
+      high: c.h,
+      low: c.l,
+      close: c.c,
+      color: c.isClosed ? undefined : candleColor(c.c, c.o, true),
+      wickColor: c.isClosed ? undefined : candleColor(c.c, c.o, true),
+    }));
 
     try {
+      seriesRef.current.setData(formatted);
+      dataLoadedRef.current = true;
+      // Scroll to the latest candle, keep some right padding
+      chartRef.current?.timeScale().scrollToRealTime();
+    } catch {}
+  }, [candles]);
+
+  // ── Apply live WS tick — update the current open candle ──────────────────
+  useEffect(() => {
+    if (!seriesRef.current || !liveCandle || !dataLoadedRef.current) return;
+
+    try {
+      const col = candleColor(liveCandle.c, liveCandle.o, true);
       seriesRef.current.update({
         time: toChartTime(liveCandle.t),
         open: liveCandle.o,
         high: liveCandle.h,
         low: liveCandle.l,
         close: liveCandle.c,
-        color: liveCandle.c >= liveCandle.o ? "#00e5b3" : "#ff5c7a",
-        wickColor: liveCandle.c >= liveCandle.o ? "#00e5b3" : "#ff5c7a",
+        color: col,
+        wickColor: col,
       });
     } catch {}
   }, [liveCandle]);

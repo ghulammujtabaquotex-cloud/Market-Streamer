@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, Link } from "wouter";
+import { useQueryClient } from "@tanstack/react-query";
 import { useGetCandles, getGetCandlesQueryKey, useListInstruments } from "@workspace/api-client-react";
 import { Chart, type LiveCandleData } from "@/components/Chart";
 import { ArrowLeft, Activity, Clock, AlertCircle, Wifi, WifiOff } from "lucide-react";
 import { formatPrice, formatPercent, formatChange, cn } from "@/lib/utils";
 
+// ── Live WebSocket hook ────────────────────────────────────────────────────────
 function useChartWs(symbol: string | undefined) {
   const [liveCandle, setLiveCandle] = useState<LiveCandleData | null>(null);
   const [livePrice, setLivePrice] = useState<number | null>(null);
@@ -35,7 +37,6 @@ function useChartWs(symbol: string | undefined) {
           timestamp?: number;
           candle?: LiveCandleData;
         };
-
         if ((msg.type === "tick" || msg.type === "candle") && msg.candle) {
           setLiveCandle(msg.candle);
           if (msg.price != null) setLivePrice(msg.price);
@@ -55,6 +56,10 @@ function useChartWs(symbol: string | undefined) {
 
   useEffect(() => {
     unmounted.current = false;
+    // Reset live state when symbol changes
+    setLiveCandle(null);
+    setLivePrice(null);
+    setConnected(false);
     connect();
     return () => {
       unmounted.current = true;
@@ -66,33 +71,55 @@ function useChartWs(symbol: string | undefined) {
   return { liveCandle, livePrice, connected };
 }
 
+// ── Chart page ─────────────────────────────────────────────────────────────────
 export default function ChartView() {
   const { symbol } = useParams<{ symbol: string }>();
+  const queryClient = useQueryClient();
 
   const { data: instrumentsResponse } = useListInstruments({
     query: { refetchInterval: 10000, queryKey: ["listInstruments"] },
   });
   const instrument = instrumentsResponse?.instruments.find((i) => i.symbol === symbol);
 
+  const candlesQueryKey = getGetCandlesQueryKey({ symbol: symbol ?? "" });
+
   const { data: candlesResponse, isLoading, isError } = useGetCandles(
     { symbol: symbol ?? "" },
     {
       query: {
         enabled: !!symbol,
-        queryKey: getGetCandlesQueryKey({ symbol: symbol ?? "" }),
-        refetchInterval: 30000,
-        staleTime: 0,
-        refetchOnWindowFocus: true,
+        queryKey: candlesQueryKey,
+        // Don't auto-refetch — WS handles live updates.
+        // We only refetch once on WS connect to get the freshest snapshot.
+        refetchInterval: false,
+        staleTime: Infinity,
+        refetchOnWindowFocus: false,
       },
     },
   );
 
   const { liveCandle, livePrice, connected } = useChartWs(symbol);
 
+  // When WS first connects for this symbol, fetch a fresh candles snapshot
+  // so the chart starts from the latest REST data (no stale cached data).
+  const didRefetchOnConnect = useRef(false);
+  useEffect(() => {
+    if (connected && !didRefetchOnConnect.current) {
+      didRefetchOnConnect.current = true;
+      void queryClient.invalidateQueries({ queryKey: candlesQueryKey });
+    }
+    if (!connected) {
+      didRefetchOnConnect.current = false;
+    }
+  }, [connected, candlesQueryKey, queryClient]);
+
   const displayPrice = livePrice ?? instrument?.currentPrice ?? null;
+
+  const hasCandles = (candlesResponse?.candles?.length ?? 0) > 0;
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-background">
+      {/* ── Header ── */}
       <header className="flex-none h-14 border-b border-border bg-card px-4 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3 min-w-0">
           <Link
@@ -168,29 +195,43 @@ export default function ChartView() {
             </>
           )}
 
+          {/* WS connection indicator */}
           <div
             className={cn(
-              "flex items-center gap-1 text-xs font-mono",
-              connected ? "text-emerald-400" : "text-muted-foreground",
+              "flex items-center gap-1.5 text-xs font-mono px-2 py-1 rounded",
+              connected
+                ? "text-emerald-400 bg-emerald-400/10"
+                : "text-muted-foreground bg-muted/30",
             )}
-            title={connected ? "Live feed connected" : "Connecting..."}
+            title={connected ? "Live feed connected" : "Connecting to live feed..."}
           >
-            {connected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+            {connected
+              ? <Wifi className="h-3.5 w-3.5" />
+              : <WifiOff className="h-3.5 w-3.5 animate-pulse" />
+            }
+            <span className="hidden sm:inline text-[10px] tracking-wider font-bold">
+              {connected ? "LIVE" : "..."}
+            </span>
           </div>
         </div>
       </header>
 
+      {/* ── Chart area ── */}
       <main className="flex-1 relative overflow-hidden">
-        {isLoading && !candlesResponse && (
-          <div className="absolute inset-0 flex items-center justify-center bg-background/80 backdrop-blur-sm z-10">
-            <div className="flex flex-col items-center text-cyan-400">
-              <Activity className="h-7 w-7 animate-pulse mb-3" />
-              <p className="font-mono text-sm animate-pulse tracking-wider">Loading market data...</p>
+        {/* Loading — waiting for first data */}
+        {(isLoading || !hasCandles) && !isError && (
+          <div className="absolute inset-0 flex items-center justify-center bg-background/90 backdrop-blur-sm z-10">
+            <div className="flex flex-col items-center text-cyan-400 gap-3">
+              <Activity className="h-7 w-7 animate-pulse" />
+              <p className="font-mono text-sm tracking-wider animate-pulse">
+                {!connected ? "Connecting to live feed…" : "Loading market data…"}
+              </p>
             </div>
           </div>
         )}
 
-        {isError && !candlesResponse && (
+        {/* Error */}
+        {isError && !hasCandles && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
             <div className="flex flex-col items-center text-red-400 p-6 bg-card border border-red-400/20 rounded-lg">
               <AlertCircle className="h-7 w-7 mb-3" />
@@ -200,16 +241,11 @@ export default function ChartView() {
           </div>
         )}
 
-        {candlesResponse?.candles && candlesResponse.candles.length > 0 ? (
+        {/* Chart */}
+        {hasCandles && (
           <div className="w-full h-full">
-            <Chart candles={candlesResponse.candles} liveCandle={liveCandle} />
+            <Chart candles={candlesResponse!.candles!} liveCandle={liveCandle} />
           </div>
-        ) : (
-          !isLoading && (
-            <div className="w-full h-full flex items-center justify-center text-muted-foreground font-mono text-sm">
-              No candle data available
-            </div>
-          )
         )}
       </main>
     </div>
