@@ -500,15 +500,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             else:
                 verdict = f"FILLING: {ws_closed_n}/{total_gap_min} candles filled — {remain_gap}min remaining"
 
-            data = {
-                "symbol":       sym,
-                "count":        len(candles),
-                "rest_candles": len(rest_candles),
-                "ws_closed":    len(agg.closed) if agg else 0,
-                "gap_status":   verdict,
-                "latest_candle": candles[-1] if candles else None,
-                "candles":      candles,
-            }
+            data = candles
 
         writer.write(_resp(data))
         await writer.drain()
