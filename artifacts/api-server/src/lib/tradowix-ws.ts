@@ -155,7 +155,7 @@ class TradowixWsManager {
         this.send({ type: "subscribe", symbols: openSymbols, timeframe: 1 });
       }
 
-      if (newOpenSymbols.length > 0 && !this.priceSeeded) {
+      if (!this.priceSeeded) {
         this.priceSeeded = true;
         void this.seedPricesFromRest(openSymbols);
       }

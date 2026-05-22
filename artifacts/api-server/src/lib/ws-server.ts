@@ -35,7 +35,7 @@ export function attachWsServer(server: Server): void {
       pathname = url.pathname;
     } catch {}
 
-    if (pathname !== "/ws") {
+    if (pathname !== "/api/ws") {
       socket.destroy();
       return;
     }
@@ -82,5 +82,5 @@ export function attachWsServer(server: Server): void {
     });
   });
 
-  logger.info("Frontend WebSocket server attached at /ws");
+  logger.info("Frontend WebSocket server attached at /api/ws");
 }

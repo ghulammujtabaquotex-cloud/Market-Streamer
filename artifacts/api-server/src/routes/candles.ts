@@ -31,7 +31,7 @@ async function fetchHistoricalCandles(
   const cacheBust = Date.now();
   const url =
     `${TRADOWIX_BASE}?symbol=${encodeURIComponent(symbol)}` +
-    `&timeframe=${TIMEFRAME_SEC}&count=200&_t=${cacheBust}`;
+    `&timeframe=${TIMEFRAME_SEC}&count=500&_t=${cacheBust}`;
 
   const res = await fetch(url, {
     headers: {

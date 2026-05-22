@@ -17,7 +17,7 @@ function useChartWs(symbol: string | undefined) {
     if (!symbol || unmounted.current) return;
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${window.location.host}/ws?symbol=${encodeURIComponent(symbol)}`;
+    const url = `${proto}//${window.location.host}/api/ws?symbol=${encodeURIComponent(symbol)}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
