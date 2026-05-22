@@ -1,22 +1,22 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: TradoWix Market Data API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: market
+    description: Market data operations
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,13 +24,170 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /instruments:
+    get:
+      operationId: listInstruments
+      tags: [market]
+      summary: List all open trading instruments with payout rates
+      responses:
+        "200":
+          description: List of instruments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentsResponse"
+
+  /candles:
+    get:
+      operationId: getCandles
+      tags: [market]
+      summary: Get historical + live candlestick data for a symbol
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Trading symbol e.g. EURUSD
+      responses:
+        "200":
+          description: Candle data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandlesResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required: [status]
       properties:
         status:
           type: string
-      required:
-        - status
 
+    Instrument:
+      type: object
+      required:
+        - symbol
+        - displayName
+        - category
+        - groupName
+        - isOpen
+        - isOTC
+        - precision
+        - turboPayoutRate
+        - blitzPayoutRate
+        - change24h
+        - changePercent24h
+      properties:
+        symbol:
+          type: string
+        displayName:
+          type: string
+        name:
+          type: string
+        category:
+          type: string
+        groupName:
+          type: string
+        isOpen:
+          type: boolean
+        isOTC:
+          type: boolean
+        precision:
+          type: integer
+        turboPayoutRate:
+          type: number
+          description: Turbo payout as decimal e.g. 0.77 = 77%
+        blitzPayoutRate:
+          type: number
+          description: Blitz payout as decimal e.g. 0.81 = 81%
+        change24h:
+          type: number
+        changePercent24h:
+          type: number
+        currentPrice:
+          type: ["number", "null"]
+          description: Latest tick price from live WebSocket
+
+    InstrumentsResponse:
+      type: object
+      required: [instruments, total, open]
+      properties:
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instrument"
+        total:
+          type: integer
+        open:
+          type: integer
+
+    Candle:
+      type: object
+      required: [symbol, timeframe, t, datetime_utc, datetime_utc5, o, h, l, c, isClosed]
+      properties:
+        symbol:
+          type: string
+        timeframe:
+          type: integer
+          description: Timeframe in seconds (60 = 1min)
+        t:
+          type: number
+          description: Open time as Unix milliseconds (UTC)
+        datetime_utc:
+          type: string
+          description: Candle open time in UTC  e.g. 2026-05-21 13:15:00
+        datetime_utc5:
+          type: string
+          description: Candle open time in UTC+5 e.g. 2026-05-21 18:15:00
+        o:
+          type: number
+        h:
+          type: number
+        l:
+          type: number
+        c:
+          type: number
+        isClosed:
+          type: boolean
+
+    CandlesResponse:
+      type: object
+      required: [symbol, timeframe, timeframe_label, count, candles, has_live_tick]
+      properties:
+        symbol:
+          type: string
+        timeframe:
+          type: integer
+        timeframe_label:
+          type: string
+        count:
+          type: integer
+        oldest_t:
+          type: ["number", "null"]
+        latest_t:
+          type: ["number", "null"]
+        has_live_tick:
+          type: boolean
+        fetch_error:
+          type: ["string", "null"]
+        candles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Candle"
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

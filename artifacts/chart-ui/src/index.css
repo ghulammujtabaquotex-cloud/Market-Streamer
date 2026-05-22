@@ -1,0 +1,201 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-card-border: hsl(var(--card-border));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-popover-border: hsl(var(--popover-border));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-primary-border: var(--primary-border);
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-secondary-border: var(--secondary-border);
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-muted-border: var(--muted-border);
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-accent-border: var(--accent-border);
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-destructive-border: var(--destructive-border);
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-primary-border: var(--sidebar-primary-border);
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-accent-border: var(--sidebar-accent-border);
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --color-bullish: hsl(var(--bullish));
+  --color-bullish-foreground: hsl(var(--bullish-foreground));
+  --color-bearish: hsl(var(--bearish));
+  --color-bearish-foreground: hsl(var(--bearish-foreground));
+
+  --font-sans: var(--app-font-sans);
+  --font-serif: var(--app-font-serif);
+  --font-mono: var(--app-font-mono);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  /* Deep dark terminal background */
+  --background: 220 15% 5%; 
+  --foreground: 220 10% 90%; 
+
+  --border: 220 15% 15%; 
+  --input: 220 15% 15%; 
+  --ring: 160 100% 50%; /* Cyan/Teal focus */
+
+  --card: 220 15% 8%; 
+  --card-foreground: 220 10% 90%; 
+  --card-border: 220 15% 12%; 
+
+  --popover: 220 15% 8%; 
+  --popover-foreground: 220 10% 90%; 
+  --popover-border: 220 15% 15%; 
+
+  --primary: 160 100% 40%; /* Vibrant cyan */
+  --primary-foreground: 220 15% 5%; 
+
+  --secondary: 220 15% 15%; 
+  --secondary-foreground: 220 10% 90%; 
+
+  --muted: 220 15% 15%; 
+  --muted-foreground: 220 10% 60%; 
+
+  --accent: 220 15% 18%; 
+  --accent-foreground: 220 10% 95%; 
+
+  --destructive: 345 100% 55%; 
+  --destructive-foreground: 220 10% 95%; 
+
+  --bullish: 152 70% 45%;
+  --bullish-foreground: 220 15% 5%;
+  --bearish: 345 90% 55%;
+  --bearish-foreground: 220 10% 95%;
+
+  --chart-1: 160 100% 40%; 
+  --chart-2: 345 100% 55%; 
+  --chart-3: 40 100% 55%; 
+  --chart-4: 280 100% 65%; 
+  --chart-5: 200 100% 60%; 
+
+  --sidebar: 220 15% 6%; 
+  --sidebar-foreground: 220 10% 90%; 
+  --sidebar-border: 220 15% 12%; 
+  --sidebar-primary: 160 100% 40%; 
+  --sidebar-primary-foreground: 220 15% 5%; 
+  --sidebar-accent: 220 15% 15%; 
+  --sidebar-accent-foreground: 220 10% 95%; 
+  --sidebar-ring: 160 100% 40%; 
+
+  --app-font-sans: 'Inter', system-ui, sans-serif;
+  --app-font-serif: Georgia, serif;
+  --app-font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  
+  --radius: 0.25rem; 
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.5);
+  --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.5), 0 1px 2px -1px rgb(0 0 0 / 0.5);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.5), 0 2px 4px -2px rgb(0 0 0 / 0.5);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.5), 0 4px 6px -4px rgb(0 0 0 / 0.5);
+}
+
+.dark {
+  /* No separate dark block needed as root is already dark, but fulfilling structure */
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  --background: 220 15% 5%; 
+  --foreground: 220 10% 90%; 
+
+  --border: 220 15% 15%; 
+  --input: 220 15% 15%; 
+  --ring: 160 100% 50%; 
+
+  --card: 220 15% 8%; 
+  --card-foreground: 220 10% 90%; 
+  --card-border: 220 15% 12%; 
+
+  --popover: 220 15% 8%; 
+  --popover-foreground: 220 10% 90%; 
+  --popover-border: 220 15% 15%; 
+
+  --primary: 160 100% 40%; 
+  --primary-foreground: 220 15% 5%; 
+
+  --secondary: 220 15% 15%; 
+  --secondary-foreground: 220 10% 90%; 
+
+  --muted: 220 15% 15%; 
+  --muted-foreground: 220 10% 60%; 
+
+  --accent: 220 15% 18%; 
+  --accent-foreground: 220 10% 95%; 
+
+  --destructive: 345 100% 55%; 
+  --destructive-foreground: 220 10% 95%; 
+  
+  --bullish: 152 70% 45%;
+  --bullish-foreground: 220 15% 5%;
+  --bearish: 345 90% 55%;
+  --bearish-foreground: 220 10% 95%;
+
+  --chart-1: 160 100% 40%; 
+  --chart-2: 345 100% 55%; 
+  --chart-3: 40 100% 55%; 
+  --chart-4: 280 100% 65%; 
+  --chart-5: 200 100% 60%; 
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+}
