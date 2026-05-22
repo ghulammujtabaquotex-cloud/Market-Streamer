@@ -243,7 +243,7 @@ def _fetch_rest_sync(symbol: str, token: str, count: int = 200) -> list[Candle]:
     url = f"{REST_URL}?{params}"
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
-        "Cookie":     f"oauth_session_token={token}",
+        "Cookie":     f"session-token={token}; oauth_session_token={token}",
         "Accept":     "application/json",
         "Referer":    "https://tradowix.com/trading",
     })
