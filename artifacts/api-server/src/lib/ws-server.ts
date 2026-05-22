@@ -1,8 +1,15 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage, Server } from "http";
-import { tradowixWs } from "./tradowix-ws.js";
+import { tradowixWs, type TickCallback } from "./tradowix-ws.js";
 import { logger } from "./logger.js";
 import type { Candle } from "./tick-aggregator.js";
+
+// Max bytes we allow to queue in the send buffer before dropping a tick.
+// Keeps slow clients from accumulating a stale backlog.
+const MAX_BUFFERED_BYTES = 64 * 1024;   // 64 KB
+
+// How often to send a protocol-level ping to keep browser connections alive.
+const CLIENT_PING_INTERVAL_MS = 20_000;
 
 const UTC5_OFFSET_MS = 5 * 60 * 60 * 1000;
 
@@ -20,9 +27,18 @@ function toUtc5String(ms: number): string {
 function enrichCandle(candle: Candle) {
   return {
     ...candle,
-    datetime_utc: toUtcString(candle.t),
+    datetime_utc:  toUtcString(candle.t),
     datetime_utc5: toUtc5String(candle.t),
   };
+}
+
+function trySend(ws: WebSocket, payload: string): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  // Drop tick if client is backed up — it will catch up on next REST refetch
+  if ((ws as unknown as { bufferedAmount: number }).bufferedAmount > MAX_BUFFERED_BYTES) {
+    return;
+  }
+  try { ws.send(payload); } catch {}
 }
 
 export function attachWsServer(server: Server): void {
@@ -54,31 +70,50 @@ export function attachWsServer(server: Server): void {
 
     logger.info({ symbol }, "Frontend WS: client connected");
 
-    // Send current open candle immediately so chart gets live state right away
-    const openCandle = tradowixWs.getOpenCandle(symbol);
-    if (openCandle) {
-      ws.send(JSON.stringify({ type: "candle", candle: enrichCandle(openCandle) }));
-    }
-
-    // Tick callback — fires on every quote for this symbol
-    const onTick = (candle: Candle, price: number, timestamp: number) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: "tick",
-            price,
-            timestamp,
-            candle: enrichCandle(candle),
-          }),
-        );
+    // ── Tick callback — fired on every live quote ──────────────────────────
+    // closedCandle is non-null when a candle period just rolled over.
+    // We send it so the frontend can fill gaps between REST data and the live feed.
+    const onTick: TickCallback = (openCandle, price, timestamp, closedCandle) => {
+      if (closedCandle) {
+        trySend(ws, JSON.stringify({
+          type: "candle_closed",
+          candle: enrichCandle(closedCandle),
+        }));
       }
+
+      trySend(ws, JSON.stringify({
+        type:      "tick",
+        price,
+        timestamp,
+        candle:    enrichCandle(openCandle),
+      }));
     };
 
-    // Subscribe on-demand: increments ref count, subscribes TradoWix if first client
+    // ── Subscribe before sending the initial snapshot ──────────────────────
+    // This order ensures zero ticks are missed: the callback is registered
+    // before we read the open candle, so any concurrent tick will be delivered.
     tradowixWs.subscribeForClient(symbol, onTick);
 
+    // Send current open candle so the chart can render immediately while
+    // waiting for the next live tick.
+    const openCandle = tradowixWs.getOpenCandle(symbol);
+    if (openCandle) {
+      trySend(ws, JSON.stringify({ type: "candle", candle: enrichCandle(openCandle) }));
+    }
+
+    // ── Keep-alive: ping every 20s ─────────────────────────────────────────
+    // Prevents browsers from silently dropping idle WS connections which
+    // would cause "stuck" tick displays.
+    const pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.ping(); } catch {}
+      } else {
+        clearInterval(pingTimer);
+      }
+    }, CLIENT_PING_INTERVAL_MS);
+
     ws.on("close", () => {
-      // Unsubscribe on-demand: decrements ref count, unsubscribes TradoWix if last client
+      clearInterval(pingTimer);
       tradowixWs.unsubscribeForClient(symbol, onTick);
       logger.info({ symbol }, "Frontend WS: client disconnected");
     });

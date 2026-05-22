@@ -32,9 +32,13 @@ function useChartWs(symbol: string | undefined) {
           price?: number;
           candle?: LiveCandleData;
         };
-        if ((msg.type === "tick" || msg.type === "candle") && msg.candle) {
-          setLiveCandle(msg.candle);
+        if (msg.type === "tick" || msg.type === "candle") {
+          // Live open candle — highlight with live color
+          if (msg.candle) setLiveCandle({ ...msg.candle, isClosed: false });
           if (msg.price != null) setLivePrice(msg.price);
+        } else if (msg.type === "candle_closed" && msg.candle) {
+          // Candle just closed (period rolled) — update with standard closed colors
+          setLiveCandle({ ...msg.candle, isClosed: true });
         }
       } catch {}
     };
@@ -84,7 +88,9 @@ export default function ChartView() {
         queryKey:           getGetCandlesQueryKey({ symbol: symbol ?? "" }),
         staleTime:          0,                        // always re-fetch
         refetchOnWindowFocus: false,
-        refetchInterval:    false,
+        // Refetch every 30s to bridge any lag between TradoWix REST and live WS.
+        // The Chart component skips setData if first/last/count unchanged.
+        refetchInterval:    30_000,
       },
     },
   );

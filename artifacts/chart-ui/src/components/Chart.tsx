@@ -148,11 +148,14 @@ export const Chart = ({ candles, liveCandle }: ChartProps) => {
     } catch {}
   }, [candles]);
 
-  // ── Live tick — update the current open candle ──────────────────────────────
+  // ── Live tick — update open OR just-closed candle ───────────────────────────
   useEffect(() => {
     if (!seriesRef.current || !liveCandle || !dataLoadedRef.current) return;
     try {
-      const col = candleColor(liveCandle.c, liveCandle.o, true);
+      // Open candle → bright live highlight so it stands out
+      // Closed candle (period just rolled) → undefined = series default up/down color
+      const isOpen = !liveCandle.isClosed;
+      const col    = isOpen ? candleColor(liveCandle.c, liveCandle.o, true) : undefined;
       seriesRef.current.update({
         time:      toChartTime(liveCandle.t),
         open:      liveCandle.o,
