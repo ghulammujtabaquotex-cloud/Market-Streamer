@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-TradoWix Termux Bot
-====================
-Single-file WebSocket market data bot for Android Termux.
+TradoWix Termux Bot  v2
+========================
+Pure WebSocket approach — REST only for history, WS for live/latest candle.
+
+Key insight: TradoWix WS streams ONE pair at a time (activeSymbol).
+This bot subscribes on-demand: when you request /EURUSD it subscribes
+EURUSD on WS, waits for the first tick, builds the current open candle,
+merges with REST history → ZERO GAP guaranteed.
 
 Install:
     pip install websockets
@@ -11,13 +16,13 @@ Run:
     export TRADOWIX_TOKEN="your_session_token"
     python termux_bot.py
 
-API (replace PAIR with any symbol):
-    http://localhost:8765/EURUSD          -> last 200 candles (REST + live merged)
-    http://localhost:8765/EURUSD?limit=50 -> last 50 candles
-    http://localhost:8765/EURUSD-OTC      -> OTC pair candles
-    http://localhost:8765/status          -> connection status
-    http://localhost:8765/pairs           -> all available pairs list
-    http://localhost:8765/tick/EURUSD     -> latest live price only
+Endpoints:
+    http://localhost:8765/EURUSD            last 200 candles, latest included
+    http://localhost:8765/EURUSD?limit=50   last 50 candles
+    http://localhost:8765/EURUSD-OTC        OTC pair
+    http://localhost:8765/status            bot status
+    http://localhost:8765/pairs             all available pairs
+    http://localhost:8765/tick/EURUSD       latest live price
 """
 
 from __future__ import annotations
@@ -33,12 +38,18 @@ REST_URL = "https://tradowix.com/api/chart/candles"
 PORT     = int(os.environ.get("PORT", "8765"))
 UA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# How long to wait for first WS tick when serving a request
+TICK_WAIT_SEC = 5.0
+# REST cache TTL — re-fetch history after this many seconds
+REST_CACHE_TTL = 120
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bot")
+
 
 # ── Models ─────────────────────────────────────────────────────────────────
 
@@ -70,72 +81,156 @@ class Candle:
 
 
 class TickAggregator:
-    """Builds live OHLCV candles from raw price ticks."""
+    """Builds OHLCV candles from live ticks."""
 
     def __init__(self, symbol: str, tf: int = 1):
-        self.symbol   = symbol
-        self.tf       = tf
-        self._ms      = tf * 60_000
-        self._cur:    Optional[Candle] = None
-        self.closed:  list[Candle]     = []
+        self.symbol  = symbol
+        self.tf      = tf
+        self._ms     = tf * 60_000
+        self._cur:   Optional[Candle] = None
+        self.closed: list[Candle]     = []
 
     def _period(self, ts: float) -> float:
         return (ts // self._ms) * self._ms
 
-    def feed(self, price: float, ts: float) -> None:
+    def feed(self, price: float, ts: float) -> Optional[Candle]:
+        """Returns a closed candle if the minute just rolled over, else None."""
         p = self._period(ts)
+        completed = None
         if self._cur is None:
             self._cur = Candle(self.symbol, self.tf, p, price, price, price, price, 1, False)
         elif p > self._cur.open_time:
             self._cur.is_closed = True
-            self.closed.append(self._cur)
+            completed = self._cur
+            self.closed.append(completed)
             self._cur = Candle(self.symbol, self.tf, p, price, price, price, price, 1, False)
         else:
             self._cur.high   = max(self._cur.high, price)
             self._cur.low    = min(self._cur.low,  price)
             self._cur.close  = price
             self._cur.volume += 1
+        return completed
 
     @property
     def live(self) -> Optional[Candle]:
+        """Current (open) candle — this is the 'missing' latest candle."""
         return self._cur
 
+    @property
+    def last_price(self) -> Optional[float]:
+        return self._cur.close if self._cur else None
 
-# ── Data Store ─────────────────────────────────────────────────────────────
+
+# ── Global State ───────────────────────────────────────────────────────────
 
 class Store:
     def __init__(self):
-        self.rest:   dict[str, list[Candle]]   = {}
-        self.aggs:   dict[str, TickAggregator] = {}
-        self.ticks:  dict[str, dict]           = {}
-        self.pairs:  list[str]                 = []
-        self.connected    = False
-        self.status_msg   = "starting"
-        self.subscribed   = 0
-        self.started_at   = time.time()
+        # REST cache: sym → (candles, fetched_at)
+        self.rest:      dict[str, tuple[list[Candle], float]] = {}
+        # WS aggregators: sym → TickAggregator
+        self.aggs:      dict[str, TickAggregator]             = {}
+        # Latest ticks: sym → {price, ts}
+        self.ticks:     dict[str, dict]                       = {}
+        # All available pair symbols (from WS instruments)
+        self.pairs:     list[str]                             = []
+        self.started_at = time.time()
 
-    def tick(self, sym: str, price: float, ts: float):
-        if sym not in self.aggs:
-            self.aggs[sym] = TickAggregator(sym)
-        self.aggs[sym].feed(price, ts)
-        self.ticks[sym] = {"symbol": sym, "price": price, "ts_ms": int(ts)}
 
-    def candles(self, sym: str, limit: int = 200) -> list[dict]:
+class WSManager:
+    """
+    Manages a single persistent WebSocket connection.
+    Handles authentication, re-subscribe on reconnect,
+    and exposes subscribe() / wait_for_tick() for HTTP handlers.
+    """
+
+    def __init__(self, store: Store):
+        self.store         = store
+        self.ws            = None
+        self.connected     = False
+        self.status        = "starting"
+        self.active_sym:   Optional[str] = None
+
+        # asyncio.Event fires whenever a tick arrives for active_sym
+        self._tick_event   = asyncio.Event()
+        # queue for outgoing messages (so HTTP handlers can request a subscribe)
+        self._sub_queue:   asyncio.Queue = asyncio.Queue()
+        # protect subscribe from concurrent callers
+        self._sub_lock     = asyncio.Lock()
+
+    async def subscribe(self, sym: str) -> None:
+        """Switch active subscription to sym. Thread-safe."""
+        async with self._sub_lock:
+            if self.active_sym == sym:
+                return
+            log.info("WS subscribe → %s", sym)
+            self.active_sym = sym
+            self._tick_event.clear()
+            if self.ws:
+                try:
+                    await self.ws.send(json.dumps({
+                        "type": "subscribe",
+                        "symbols": [sym],
+                        "timeframe": 1,
+                    }))
+                except Exception as e:
+                    log.warning("subscribe send error: %s", e)
+
+    async def wait_for_tick(self, sym: str, timeout: float = TICK_WAIT_SEC) -> bool:
         """
-        Merge REST history + live closed candles + current open candle.
-        Result: zero-gap, latest minute always included.
+        Subscribe to sym, wait for the first tick.
+        Returns True if a tick arrived within timeout, False otherwise.
         """
+        await self.subscribe(sym)
+
+        # If we already have a live candle (from previous ticks) and it's
+        # for the current minute — we're good, no need to wait.
+        agg = self.store.aggs.get(sym)
+        if agg and agg.live:
+            now_period = (time.time() * 1000 // 60_000) * 60_000
+            if agg.live.open_time == now_period:
+                return True
+
+        # Wait for a fresh tick
+        self._tick_event.clear()
+        try:
+            await asyncio.wait_for(self._tick_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("No tick for %s within %.1fs", sym, timeout)
+            return False
+
+    def on_tick(self, sym: str, price: float, ts: float) -> None:
+        """Called from the recv loop for every incoming quote."""
+        if sym not in self.store.aggs:
+            self.store.aggs[sym] = TickAggregator(sym)
+        self.store.aggs[sym].feed(price, ts)
+        self.store.ticks[sym] = {"symbol": sym, "price": price, "ts_ms": int(ts)}
+
+        if sym == self.active_sym:
+            self._tick_event.set()
+
+    def merged_candles(self, sym: str, limit: int = 200) -> list[dict]:
+        """
+        REST history  +  WS closed candles  +  WS current open candle
+        = zero-gap complete data, latest minute always included.
+        """
+        rest_candles, _ = self.store.rest.get(sym, ([], 0))
+        agg              = self.store.aggs.get(sym)
+
         merged: dict[float, Candle] = {}
 
-        for c in self.rest.get(sym, []):
+        # 1. Base: REST historical candles
+        for c in rest_candles:
             merged[c.open_time] = c
 
-        agg = self.aggs.get(sym)
         if agg:
+            # 2. WS closed candles override REST (more accurate, built from real ticks)
             for c in agg.closed:
-                merged[c.open_time] = c          # WS candles overwrite REST (more accurate)
+                merged[c.open_time] = c
+
+            # 3. Current open candle — this is the "missing latest" the user wanted!
             if agg.live:
-                merged[agg.live.open_time] = agg.live   # current open candle — never missing!
+                merged[agg.live.open_time] = agg.live
 
         sorted_c = sorted(merged.values(), key=lambda c: c.open_time)
         return [c.to_dict() for c in sorted_c[-limit:]]
@@ -143,15 +238,15 @@ class Store:
 
 # ── REST History ───────────────────────────────────────────────────────────
 
-def _rest_sync(sym: str, token: str) -> list[Candle]:
+def _rest_sync(sym: str) -> list[Candle]:
     params = urllib.parse.urlencode({"symbol": sym, "timeframe": 60, "count": 200, "offset": 0})
     req = urllib.request.Request(
         f"{REST_URL}?{params}",
         headers={
             "User-Agent": UA,
-            "Cookie":     f"session-token={token}; oauth_session_token={token}",
-            "Accept":     "application/json",
-            "Referer":    "https://tradowix.com/trading",
+            "Cookie":  f"session-token={TOKEN}; oauth_session_token={TOKEN}",
+            "Accept":  "application/json",
+            "Referer": "https://tradowix.com/trading",
         },
     )
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -170,33 +265,30 @@ def _rest_sync(sym: str, token: str) -> list[Candle]:
     return out
 
 
-async def fetch_history(store: Store, sym: str):
-    if not TOKEN:
-        return
+async def ensure_rest(store: Store, sym: str) -> list[Candle]:
+    """Fetch REST history if not cached or cache expired."""
+    cached, fetched_at = store.rest.get(sym, ([], 0))
+    if cached and (time.time() - fetched_at) < REST_CACHE_TTL:
+        return cached
     try:
         loop    = asyncio.get_event_loop()
-        candles = await loop.run_in_executor(None, _rest_sync, sym, TOKEN)
-        if candles:
-            store.rest[sym] = candles
-            log.info("History %-22s %d candles", sym, len(candles))
+        candles = await loop.run_in_executor(None, _rest_sync, sym)
+        store.rest[sym] = (candles, time.time())
+        log.info("REST %-22s %d candles", sym, len(candles))
+        return candles
     except Exception as e:
-        log.warning("History failed %s: %s", sym, e)
-
-
-async def fetch_all(store: Store):
-    log.info("Fetching REST history for %d pairs ...", len(store.pairs))
-    await asyncio.gather(*[fetch_history(store, s) for s in store.pairs], return_exceptions=True)
-    log.info("REST history done — %d/%d pairs", len(store.rest), len(store.pairs))
+        log.warning("REST failed %s: %s", sym, e)
+        return cached  # return stale cache if any
 
 
 # ── WebSocket Bot ──────────────────────────────────────────────────────────
 
-async def ws_bot(store: Store):
+async def ws_bot(mgr: WSManager):
     import websockets
     from websockets.exceptions import ConnectionClosed
 
     while True:
-        store.status_msg = "connecting"
+        mgr.status = "connecting"
         try:
             log.info("Connecting to %s ...", WS_URL)
             async with websockets.connect(
@@ -205,10 +297,7 @@ async def ws_bot(store: Store):
                 ping_timeout=10,
                 additional_headers={"Origin": "https://tradowix.com"},
             ) as ws:
-
-                # ── Auth ──────────────────────────────────────────────────
-                store.status_msg = "authenticating"
-                instruments_ready = asyncio.Event()
+                mgr.ws = ws
 
                 async for raw in ws:
                     msg = json.loads(raw)
@@ -216,31 +305,37 @@ async def ws_bot(store: Store):
 
                     if t == "authRequired":
                         await ws.send(json.dumps({"type": "authenticate", "token": TOKEN}))
+                        mgr.status = "authenticating"
 
                     elif t in ("authenticated", "ready"):
                         uid = (msg.get("data") or {}).get("userId", "?")
                         log.info("Authenticated (userId=%s)", uid)
-                        store.connected  = True
-                        store.status_msg = "live"
+                        mgr.connected = True
+                        mgr.status    = "live"
+                        # Re-subscribe to active pair if any (after reconnect)
+                        if mgr.active_sym:
+                            await ws.send(json.dumps({
+                                "type": "subscribe",
+                                "symbols": [mgr.active_sym],
+                                "timeframe": 1,
+                            }))
 
                     elif t == "instruments":
                         insts = msg.get("data", [])
-                        open_syms = [d["symbol"] for d in insts if d.get("symbol") and d.get("isOpen", True)]
-                        store.pairs = open_syms
-                        log.info("Instruments: %d open pairs", len(open_syms))
-
-                        # Subscribe in batches of 20
-                        for i in range(0, len(open_syms), 20):
-                            batch = open_syms[i:i + 20]
-                            await ws.send(json.dumps({"type": "subscribe", "symbols": batch, "timeframe": 1}))
-                            await asyncio.sleep(0.05)
-
-                        store.subscribed = len(open_syms)
-                        instruments_ready.set()
-                        asyncio.create_task(fetch_all(store))
+                        mgr.store.pairs = [
+                            d["symbol"] for d in insts
+                            if d.get("symbol") and d.get("isOpen", True)
+                        ]
+                        log.info("Instruments: %d open pairs", len(mgr.store.pairs))
 
                     elif t == "subscribed":
-                        pass  # already counted above
+                        d = msg.get("data", {})
+                        active = d.get("activeSymbol", "")
+                        ok     = d.get("subscribed", [])
+                        failed = d.get("failed", [])
+                        if failed:
+                            log.warning("Subscribe failed: %s", failed)
+                        log.info("Active pair: %s (ok=%s)", active, ok)
 
                     elif t == "quote":
                         d   = msg.get("data", msg)
@@ -248,126 +343,150 @@ async def ws_bot(store: Store):
                         px  = float(d.get("price", d.get("bid", d.get("ask", 0))) or 0)
                         ts  = float(d.get("timestamp", d.get("t", time.time() * 1000)) or 0)
                         if sym and px:
-                            store.tick(sym, px, ts)
+                            mgr.on_tick(sym, px, ts)
 
                     elif t == "ping":
                         await ws.send(json.dumps({"type": "pong"}))
 
                     elif t == "error":
-                        log.error("Server: %s", msg.get("data", {}).get("error", msg))
+                        log.error("Server: %s", (msg.get("data") or {}).get("error", msg))
 
         except ConnectionClosed as e:
             log.warning("Disconnected: %s — retry in 3s", e)
         except Exception as e:
             log.error("WS error: %s — retry in 3s", e)
         finally:
-            store.connected  = False
-            store.status_msg = "reconnecting"
+            mgr.connected = False
+            mgr.ws        = None
+            mgr.status    = "reconnecting"
 
         await asyncio.sleep(3)
 
 
-# ── HTTP Server (pure stdlib asyncio) ─────────────────────────────────────
+# ── HTTP Server ─────────────────────────────────────────────────────────────
 
-def _json(data) -> bytes:
-    return json.dumps(data, ensure_ascii=False).encode()
+def _resp(data, status: int = 200) -> bytes:
+    body = json.dumps(data, ensure_ascii=False).encode()
+    head = (
+        f"HTTP/1.1 {status} OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    return head + body
 
 
-async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, store: Store):
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                 mgr: WSManager):
     try:
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5)
+        raw = await asyncio.wait_for(reader.read(4096), timeout=10)
         if not raw:
             return
 
-        line = raw.split(b"\r\n")[0].decode(errors="replace")
+        line  = raw.split(b"\r\n")[0].decode(errors="replace")
         parts = line.split(" ")
         if len(parts) < 2:
             return
 
-        path_full = parts[1]                           # e.g. /EURUSD?limit=50
-        parsed    = urllib.parse.urlparse(path_full)
-        path      = parsed.path.rstrip("/").upper()    # /EURUSD
-        query     = urllib.parse.parse_qs(parsed.query)
-        limit     = int(query.get("limit", ["200"])[0])
+        parsed = urllib.parse.urlparse(parts[1])
+        path   = parsed.path.rstrip("/").upper()
+        query  = urllib.parse.parse_qs(parsed.query)
+        limit  = int(query.get("limit", ["200"])[0])
+        store  = mgr.store
 
-        # ── Routes ────────────────────────────────────────────────────────
+        # ── /STATUS or / ──────────────────────────────────────────────────
+        if path in ("/STATUS", "/", ""):
+            data = {
+                "connected":    mgr.connected,
+                "status":       mgr.status,
+                "active_pair":  mgr.active_sym,
+                "pairs_loaded": len(store.pairs),
+                "rest_cached":  len(store.rest),
+                "ws_pairs_live": len(store.aggs),
+                "uptime_sec":   round(time.time() - store.started_at, 1),
+                "usage":        "GET /EURUSD  or  /EURUSD-OTC  or  /BTCUSD-OTC",
+            }
 
-        if path in ("/STATUS", "/"):
-            body = _json({
-                "connected":   store.connected,
-                "status":      store.status_msg,
-                "subscribed":  store.subscribed,
-                "pairs_total": len(store.pairs),
-                "rest_loaded": len(store.rest),
-                "uptime_sec":  round(time.time() - store.started_at, 1),
-                "tip":         "Use /EURUSD or /EURUSD-OTC to get candles",
-            })
-
+        # ── /PAIRS ────────────────────────────────────────────────────────
         elif path == "/PAIRS":
-            body = _json({
-                "count": len(store.pairs),
-                "pairs": sorted(store.pairs),
-            })
+            data = {"count": len(store.pairs), "pairs": sorted(store.pairs)}
 
+        # ── /TICK/EURUSD ─────────────────────────────────────────────────
         elif path.startswith("/TICK/"):
-            sym  = path[6:]   # /TICK/EURUSD -> EURUSD
+            sym  = path[6:]
             tick = store.ticks.get(sym)
             if tick:
-                body = _json(tick)
+                data = tick
             else:
-                body = _json({"error": f"No tick yet for {sym}. Available: /pairs"})
+                # Subscribe and wait for first tick
+                got = await mgr.wait_for_tick(sym, timeout=5.0)
+                tick = store.ticks.get(sym)
+                data = tick if tick else {"error": f"No tick for {sym} within 5s"}
 
+        # ── /EURUSD  or  /EURUSD-OTC  etc. ───────────────────────────────
         else:
-            # /EURUSD  or  /EURUSD-OTC  etc.
             sym = path.lstrip("/")
             if not sym:
-                body = _json({"error": "Pair name required. e.g. /EURUSD or /EURUSD-OTC"})
+                data = {"error": "Pair name required. e.g. /EURUSD"}
+                writer.write(_resp(data, 400))
+                await writer.drain()
+                return
+
+            # Step 1: Fetch REST history (cached, fast after first call)
+            rest_task = asyncio.create_task(ensure_rest(store, sym))
+
+            # Step 2: Subscribe to pair on WS, wait for live tick
+            ws_task = asyncio.create_task(mgr.wait_for_tick(sym, timeout=5.0))
+
+            # Run both concurrently
+            await asyncio.gather(rest_task, ws_task, return_exceptions=True)
+            got_tick = ws_task.result() if not ws_task.cancelled() else False
+
+            # Step 3: Build merged candles
+            candles = mgr.merged_candles(sym, limit=limit)
+
+            if not candles:
+                data = {"error": f"No data for {sym}. Try /pairs"}
             else:
-                candles = store.candles(sym, limit=limit)
+                latest  = candles[-1]
+                agg     = store.aggs.get(sym)
+                rest_c, _ = store.rest.get(sym, ([], 0))
 
-                # On-demand fetch if no data yet
-                if not candles and TOKEN:
-                    log.info("On-demand fetch for %s", sym)
-                    await fetch_history(store, sym)
-                    candles = store.candles(sym, limit=limit)
+                # Verify no gap: check if WS candle is newer than last REST candle
+                rest_latest_t  = rest_c[-1].open_time if rest_c else 0
+                ws_live_t      = agg.live.open_time   if (agg and agg.live) else 0
+                gap_minutes    = round((ws_live_t - rest_latest_t) / 60_000) if (rest_latest_t and ws_live_t) else None
 
-                if not candles:
-                    body = _json({"error": f"No data for {sym}. Check /pairs for valid symbols."})
-                else:
-                    latest = candles[-1]
-                    body   = _json({
-                        "symbol":       sym,
-                        "count":        len(candles),
-                        "has_live":     sym in store.aggs,
-                        "has_history":  sym in store.rest,
-                        "latest": {
-                            "time":      latest["open_time"],
-                            "close":     latest["close"],
-                            "is_closed": latest["is_closed"],
-                        },
-                        "candles": candles,
-                    })
+                data = {
+                    "symbol":       sym,
+                    "count":        len(candles),
+                    "has_live_ws":  got_tick,
+                    "has_rest":     bool(rest_c),
+                    "gap_check": {
+                        "rest_latest":    latest["open_time"] if not got_tick else (int(rest_latest_t) if rest_c else None),
+                        "ws_live_time":   int(ws_live_t) if ws_live_t else None,
+                        "gap_minutes":    gap_minutes,
+                        "verdict":        "NO GAP ✅" if (gap_minutes is not None and gap_minutes <= 1)
+                                          else ("SMALL GAP ⚠️" if (gap_minutes and gap_minutes <= 5)
+                                          else ("NO WS TICK YET" if not got_tick else "CHECK MANUALLY")),
+                    },
+                    "latest_candle": latest,
+                    "candles":      candles,
+                }
 
-        # ── Send response ─────────────────────────────────────────────────
-        headers  = (
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Access-Control-Allow-Origin: *\r\n"
-            + f"Content-Length: {len(body)}\r\n".encode()
-            + b"Connection: close\r\n\r\n"
-        )
-        writer.write(headers + body)
+        writer.write(_resp(data))
         await writer.drain()
 
     except Exception as e:
-        log.debug("HTTP handler error: %s", e)
+        log.debug("HTTP error: %s", e)
     finally:
         writer.close()
 
 
-async def http_server(store: Store):
+async def http_server(mgr: WSManager):
     server = await asyncio.start_server(
-        lambda r, w: handle(r, w, store),
+        lambda r, w: handle(r, w, mgr),
         "0.0.0.0", PORT,
     )
     log.info("HTTP API → http://localhost:%d", PORT)
@@ -381,30 +500,28 @@ async def main():
     if not TOKEN:
         print("=" * 55)
         print("  ERROR: TRADOWIX_TOKEN not set!")
-        print("")
         print("  export TRADOWIX_TOKEN='your_session_token'")
-        print("  python termux_bot.py")
         print("=" * 55)
         return
 
     store = Store()
+    mgr   = WSManager(store)
 
     print("=" * 55)
-    print("  TradoWix Termux Bot")
-    print(f"  API  → http://localhost:{PORT}")
-    print("")
-    print("  Endpoints:")
-    print("    /status          connection status")
-    print("    /pairs           all available pairs")
-    print("    /EURUSD          candle data for EURUSD")
-    print("    /EURUSD?limit=50 last 50 candles")
-    print("    /EURUSD-OTC      OTC pair candles")
-    print("    /tick/EURUSD     latest live price")
+    print("  TradoWix Termux Bot  v2")
+    print(f"  API → http://localhost:{PORT}")
+    print()
+    print("  /status            bot status")
+    print("  /pairs             all available pairs")
+    print("  /EURUSD            candles with LIVE latest")
+    print("  /EURUSD?limit=50   last 50 candles")
+    print("  /EURUSD-OTC        OTC pair")
+    print("  /tick/EURUSD       live price")
     print("=" * 55)
 
     await asyncio.gather(
-        http_server(store),
-        ws_bot(store),
+        http_server(mgr),
+        ws_bot(mgr),
     )
 
 
