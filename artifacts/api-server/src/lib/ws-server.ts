@@ -54,26 +54,32 @@ export function attachWsServer(server: Server): void {
 
     logger.info({ symbol }, "Frontend WS: client connected");
 
+    // Send current open candle immediately so chart gets live state right away
     const openCandle = tradowixWs.getOpenCandle(symbol);
     if (openCandle) {
       ws.send(JSON.stringify({ type: "candle", candle: enrichCandle(openCandle) }));
     }
 
+    // Tick callback — fires on every quote for this symbol
     const onTick = (candle: Candle, price: number, timestamp: number) => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: "tick",
-          price,
-          timestamp,
-          candle: enrichCandle(candle),
-        }));
+        ws.send(
+          JSON.stringify({
+            type: "tick",
+            price,
+            timestamp,
+            candle: enrichCandle(candle),
+          }),
+        );
       }
     };
 
-    tradowixWs.subscribeToTicks(symbol, onTick);
+    // Subscribe on-demand: increments ref count, subscribes TradoWix if first client
+    tradowixWs.subscribeForClient(symbol, onTick);
 
     ws.on("close", () => {
-      tradowixWs.unsubscribeFromTicks(symbol, onTick);
+      // Unsubscribe on-demand: decrements ref count, unsubscribes TradoWix if last client
+      tradowixWs.unsubscribeForClient(symbol, onTick);
       logger.info({ symbol }, "Frontend WS: client disconnected");
     });
 

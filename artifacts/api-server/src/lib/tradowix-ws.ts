@@ -30,7 +30,13 @@ class TradowixWsManager {
   private ws: WebSocket | null = null;
   private token: string = "";
   private aggregators = new Map<string, TickAggregator>();
+
+  // Symbols we have sent a subscribe message for
   private subscribed = new Set<string>();
+
+  // Reference count: how many frontend WS clients are watching each symbol
+  private clientCount = new Map<string, number>();
+
   private pingTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private started = false;
@@ -100,8 +106,6 @@ class TradowixWsManager {
       const data = msg["data"] as Record<string, unknown>[] | undefined;
       if (!Array.isArray(data)) return;
 
-      let newOpenSymbols: string[] = [];
-
       for (const raw of data) {
         const symbol = raw["symbol"] as string;
         if (!symbol) continue;
@@ -132,33 +136,22 @@ class TradowixWsManager {
           currentPrice: this.lastPrice.get(symbol) ?? null,
         };
         this.instruments.set(symbol, info);
-
-        if (info.isOpen && !this.subscribed.has(symbol)) {
-          newOpenSymbols.push(symbol);
-        }
       }
 
       const openSymbols = [...this.instruments.values()]
         .filter((i) => i.isOpen)
         .map((i) => i.symbol);
 
-      logger.info({ count: openSymbols.length }, "TradoWix WS: instruments received, subscribing open symbols");
+      logger.info({ count: openSymbols.length }, "TradoWix WS: instruments received");
 
-      for (const sym of openSymbols) {
-        if (!this.subscribed.has(sym)) {
-          this.subscribed.add(sym);
-          this.getOrCreateAggregator(sym);
-        }
-      }
-
-      if (this.ws?.readyState === WebSocket.OPEN && openSymbols.length > 0) {
-        this.send({ type: "subscribe", symbols: openSymbols, timeframe: 1 });
-      }
-
+      // Seed prices for all open instruments from REST so markets list shows prices immediately
       if (!this.priceSeeded) {
         this.priceSeeded = true;
         void this.seedPricesFromRest(openSymbols);
       }
+
+      // Re-subscribe any symbols that have active clients (e.g. after reconnect)
+      this.resubscribeAll();
 
       return;
     }
@@ -173,14 +166,18 @@ class TradowixWsManager {
         this.lastPrice.set(symbol, price);
         const inst = this.instruments.get(symbol);
         if (inst) inst.currentPrice = price;
-        this.getOrCreateAggregator(symbol).update(price, ts);
 
-        const candle = this.aggregators.get(symbol)?.getOpenCandle();
-        if (candle) {
-          const listeners = this.tickListeners.get(symbol);
-          if (listeners && listeners.size > 0) {
-            for (const cb of listeners) {
-              try { cb(candle, price, ts); } catch {}
+        // Only aggregate ticks for actively watched symbols
+        if (this.subscribed.has(symbol)) {
+          this.getOrCreateAggregator(symbol).update(price, ts);
+
+          const candle = this.aggregators.get(symbol)?.getOpenCandle();
+          if (candle) {
+            const listeners = this.tickListeners.get(symbol);
+            if (listeners && listeners.size > 0) {
+              for (const cb of listeners) {
+                try { cb(candle, price, ts); } catch {}
+              }
             }
           }
         }
@@ -188,17 +185,68 @@ class TradowixWsManager {
       return;
     }
 
-    if (type === "pong" || type === "balanceUpdate" ||
-        type === "subscribed" || type === "timeSync") {
+    if (
+      type === "pong" || type === "balanceUpdate" ||
+      type === "subscribed" || type === "timeSync"
+    ) {
       return;
     }
   }
 
+  // ─── On-demand subscription (frontend WS client lifecycle) ───────────────
+
+  /**
+   * Called when a frontend WS client opens a chart for `symbol`.
+   * Increments reference count; subscribes to TradoWix if first client.
+   */
+  subscribeForClient(symbol: string, cb: TickCallback): void {
+    const count = this.clientCount.get(symbol) ?? 0;
+    this.clientCount.set(symbol, count + 1);
+
+    if (!this.tickListeners.has(symbol)) {
+      this.tickListeners.set(symbol, new Set());
+    }
+    this.tickListeners.get(symbol)!.add(cb);
+
+    if (!this.subscribed.has(symbol)) {
+      this.subscribed.add(symbol);
+      this.getOrCreateAggregator(symbol);
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.send({ type: "subscribe", symbols: [symbol], timeframe: 1 });
+        logger.info({ symbol }, "TradoWix WS: subscribed (on-demand)");
+      }
+    }
+  }
+
+  /**
+   * Called when a frontend WS client leaves the chart for `symbol`.
+   * Decrements reference count; unsubscribes from TradoWix when last client leaves.
+   */
+  unsubscribeForClient(symbol: string, cb: TickCallback): void {
+    this.tickListeners.get(symbol)?.delete(cb);
+
+    const count = (this.clientCount.get(symbol) ?? 1) - 1;
+    if (count <= 0) {
+      this.clientCount.delete(symbol);
+      this.subscribed.delete(symbol);
+      this.aggregators.delete(symbol);
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.send({ type: "unsubscribe", symbols: [symbol] });
+        logger.info({ symbol }, "TradoWix WS: unsubscribed (no clients)");
+      }
+    } else {
+      this.clientCount.set(symbol, count);
+    }
+  }
+
+  // ─── Internal helpers ─────────────────────────────────────────────────────
+
   private resubscribeAll(): void {
     if (this.subscribed.size === 0) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
     const symbols = [...this.subscribed];
     this.send({ type: "subscribe", symbols, timeframe: 1 });
-    logger.info({ symbols }, "TradoWix WS: resubscribed");
+    logger.info({ count: symbols.length }, "TradoWix WS: resubscribed active symbols");
   }
 
   private getOrCreateAggregator(symbol: string): TickAggregator {
@@ -208,44 +256,16 @@ class TradowixWsManager {
     return this.aggregators.get(symbol)!;
   }
 
-  subscribe(symbol: string): void {
-    if (this.subscribed.has(symbol)) return;
-    this.subscribed.add(symbol);
-    this.getOrCreateAggregator(symbol);
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.send({ type: "subscribe", symbols: [...this.subscribed], timeframe: 1 });
-      logger.info({ symbol, total: this.subscribed.size }, "TradoWix WS: subscribed (full list sent)");
-    }
-  }
-
-  subscribeToTicks(symbol: string, cb: TickCallback): void {
-    if (!this.tickListeners.has(symbol)) {
-      this.tickListeners.set(symbol, new Set());
-    }
-    this.tickListeners.get(symbol)!.add(cb);
-    this.subscribe(symbol);
-  }
-
-  unsubscribeFromTicks(symbol: string, cb: TickCallback): void {
-    this.tickListeners.get(symbol)?.delete(cb);
-  }
-
-  getOpenCandle(symbol: string): Candle | null {
-    return this.aggregators.get(symbol)?.getOpenCandle() ?? null;
-  }
-
-  getClosedCandles(symbol: string): Candle[] {
-    return this.aggregators.get(symbol)?.getClosedCandles() ?? [];
-  }
-
   private async seedPricesFromRest(symbols: string[]): Promise<void> {
     const token = this.token;
     if (!token) return;
 
-    const BATCH = 5;
-    const DELAY_MS = 600;
+    const BATCH = 8;
+    const DELAY_MS = 400;
     const BASE = "https://tradowix.com/api/chart/candles";
-    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    const UA =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
     let seeded = 0;
 
@@ -271,7 +291,7 @@ class TradowixWsManager {
             const candles = body.candles ?? [];
             if (candles.length === 0) return;
             const last = candles[candles.length - 1];
-            if (typeof last.c === "number" && !this.lastPrice.has(symbol)) {
+            if (typeof last.c === "number") {
               this.lastPrice.set(symbol, last.c);
               const inst = this.instruments.get(symbol);
               if (inst) inst.currentPrice = last.c;
@@ -288,6 +308,16 @@ class TradowixWsManager {
     logger.info({ seeded, total: symbols.length }, "Price seeding complete");
   }
 
+  // ─── Public accessors ─────────────────────────────────────────────────────
+
+  getOpenCandle(symbol: string): Candle | null {
+    return this.aggregators.get(symbol)?.getOpenCandle() ?? null;
+  }
+
+  getClosedCandles(symbol: string): Candle[] {
+    return this.aggregators.get(symbol)?.getClosedCandles() ?? [];
+  }
+
   getInstruments(): InstrumentInfo[] {
     return [...this.instruments.values()];
   }
@@ -295,6 +325,23 @@ class TradowixWsManager {
   getInstrument(symbol: string): InstrumentInfo | null {
     return this.instruments.get(symbol) ?? null;
   }
+
+  getLastPrice(symbol: string): number | null {
+    return this.lastPrice.get(symbol) ?? null;
+  }
+
+  // ─── Legacy helpers (used by candles route) ───────────────────────────────
+
+  subscribe(symbol: string): void {
+    if (this.subscribed.has(symbol)) return;
+    this.subscribed.add(symbol);
+    this.getOrCreateAggregator(symbol);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.send({ type: "subscribe", symbols: [symbol], timeframe: 1 });
+    }
+  }
+
+  // ─── Transport ────────────────────────────────────────────────────────────
 
   private send(payload: unknown): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
