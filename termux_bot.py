@@ -36,8 +36,11 @@ TOKEN = os.environ.get("TRADOWIX_TOKEN", "")
 WS_URL   = "wss://api.tradowix.com/ws"
 REST_URL = "https://tradowix.com/api/chart/candles"
 PORT     = int(os.environ.get("PORT", "8765"))
-TICK_WAIT_SEC   = 6.0    # wait this long for first WS tick when subscribing
+TICK_WAIT_SEC   = 8.0    # wait this long for first WS tick when subscribing
 MAX_WS_CANDLES  = 180    # keep at most N closed candles per pair from WS
+
+# Subscribe this pair on startup so it accumulates live candles from the beginning
+WARMUP_PAIR = "EURUSD"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -222,20 +225,35 @@ def merge(rest: list[Candle], agg: Optional[Agg], limit: int) -> list[dict]:
 # ── Bot state ─────────────────────────────────────────────────────────────────
 
 class Bot:
+    """
+    TradoWix WS streams EXACTLY ONE pair at a time (activeSymbol).
+    Strategy:
+      - active_sym = currently streaming pair
+      - aggs keeps ALL pairs ever requested (data never lost)
+      - switching pair: old agg data stays, new pair starts collecting
+      - warmup on startup: subscribe WARMUP_PAIR immediately so it accumulates
+        closed candles before any user request arrives
+    """
     def __init__(self):
-        self.aggs:       dict[str, Agg]  = {}
-        self.ticks:      dict[str, dict] = {}
-        self.pairs:      list[str]       = []
-        self.subscribed: set[str]        = set()   # currently subscribed pairs
-        self.active_sym: Optional[str]   = None    # last subscribed (WS activeSymbol)
+        self.aggs:      dict[str, Agg]  = {}
+        self.ticks:     dict[str, dict] = {}
+        self.pairs:     list[str]       = []
+        self.active_sym: Optional[str]  = None   # currently streaming from WS
 
         self.ws           = None
         self.connected    = False
         self.status       = "starting"
         self.started_at   = time.time()
+        self.warmup_done  = False
 
-        self._tick_event  = asyncio.Event()
+        # Per-symbol tick events
+        self._tick_events: dict[str, asyncio.Event] = {}
         self._sub_lock    = asyncio.Lock()
+
+    def _get_event(self, sym: str) -> asyncio.Event:
+        if sym not in self._tick_events:
+            self._tick_events[sym] = asyncio.Event()
+        return self._tick_events[sym]
 
     async def _send(self, data: dict) -> None:
         if self.ws:
@@ -244,31 +262,31 @@ class Bot:
             except Exception as e:
                 log.warning("WS send error: %s", e)
 
-    async def subscribe(self, sym: str) -> None:
-        """Subscribe to sym on WS. WS streams ONE pair at a time (activeSymbol)."""
+    async def switch_to(self, sym: str) -> None:
+        """Switch WS stream to sym. Old sym's agg data is preserved."""
         async with self._sub_lock:
             if self.active_sym == sym:
                 return
-            log.info("WS subscribe → %s", sym)
+            log.info("WS → %s  (was: %s)", sym, self.active_sym or "none")
             self.active_sym = sym
-            self.subscribed.add(sym)
-            self._tick_event.clear()
             if sym not in self.aggs:
                 self.aggs[sym] = Agg(sym)
+            self._get_event(sym).clear()
             await self._send({"type": "subscribe", "symbols": [sym], "timeframe": 1})
 
     async def wait_tick(self, sym: str, timeout: float = TICK_WAIT_SEC) -> bool:
-        """Subscribe + wait for first tick. If we already have ANY tick data, use it immediately."""
-        await self.subscribe(sym)
+        """Switch to sym and wait for first tick. Instant if already has open candle."""
+        await self.switch_to(sym)
 
-        # Already have an open candle from previous ticks? Use it — don't wait.
+        # Already have live data for this sym? Use it immediately.
         agg = self.aggs.get(sym)
         if agg and agg.open_candle:
             return True
 
-        self._tick_event.clear()
+        ev = self._get_event(sym)
+        ev.clear()
         try:
-            await asyncio.wait_for(self._tick_event.wait(), timeout=timeout)
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             log.warning("No tick for %s in %.0fs", sym, timeout)
@@ -280,8 +298,8 @@ class Bot:
         self.aggs[sym].feed(price, ts)
         self.ticks[sym] = {"symbol": sym, "price": price, "ts_ms": int(ts),
                            "time": _fmt_utc5(ts)}
-        if sym == self.active_sym:
-            self._tick_event.set()
+        if sym in self._tick_events:
+            self._tick_events[sym].set()
 
 
 # ── WebSocket loop ────────────────────────────────────────────────────────────
@@ -317,11 +335,11 @@ async def ws_loop(bot: Bot) -> None:
                         bot.status    = "live"
                         # Re-subscribe active pair after reconnect
                         if bot.active_sym:
-                            await ws.send(json.dumps({
+                            await bot._send({
                                 "type": "subscribe",
                                 "symbols": [bot.active_sym],
                                 "timeframe": 1,
-                            }))
+                            })
 
                     elif t == "instruments":
                         bot.pairs = [
@@ -329,6 +347,12 @@ async def ws_loop(bot: Bot) -> None:
                             if d.get("symbol") and d.get("isOpen", True)
                         ]
                         log.info("Instruments: %d open pairs", len(bot.pairs))
+                        # Warmup: subscribe one common pair immediately on first connect
+                        # so its candles start accumulating before any user request
+                        if not bot.warmup_done and WARMUP_PAIR in bot.pairs:
+                            bot.warmup_done = True
+                            await bot.switch_to(WARMUP_PAIR)
+                            log.info("Warmup: subscribed %s — accumulating candles", WARMUP_PAIR)
 
                     elif t == "subscribed":
                         d = msg.get("data", {})
@@ -412,10 +436,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                 "connected":    bot.connected,
                 "status":       bot.status,
                 "active_pair":  bot.active_sym,
+                "tracking":     sorted(bot.aggs.keys()),
                 "pairs_total":  len(bot.pairs),
-                "ws_pairs":     len(bot.aggs),
                 "uptime_sec":   round(time.time() - bot.started_at, 1),
-                "usage":        "GET /<PAIR>  e.g. /EURUSD  /EURUSD-OTC  /BTCUSD-OTC",
+                "note":         "TradoWix WS = 1 pair at a time. Pair stays tracked after switch. Gap fills over time.",
             }
 
         # ── /PAIRS ─────────────────────────────────────────────────────────
@@ -457,19 +481,24 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             candles = merge(rest_candles, agg, limit=limit)
 
             # Gap analysis
-            rest_last_t = rest_candles[-1].t if rest_candles else 0
-            ws_open_t   = agg.open_candle.t  if (agg and agg.open_candle) else 0
-            ws_closed_n = len([c for c in (agg.closed if agg else []) if c.t > rest_last_t])
-            gap_min     = round((ws_open_t - rest_last_t) / 60_000) if (rest_last_t and ws_open_t) else None
+            rest_last_t  = rest_candles[-1].t if rest_candles else 0
+            ws_open_t    = agg.open_candle.t  if (agg and agg.open_candle) else 0
+            ws_closed_n  = len([c for c in (agg.closed if agg else []) if c.t > rest_last_t])
+            # Total gap = minutes between last REST candle and current live candle
+            total_gap_min = round((ws_open_t - rest_last_t) / 60_000) if (rest_last_t and ws_open_t) else None
+            remain_gap    = max(0, (total_gap_min or 0) - ws_closed_n)
 
-            if gap_min is not None and gap_min <= 1:
+            if not got_tick:
+                verdict = "WAITING FOR FIRST TICK ⏳"
+            elif total_gap_min is None or total_gap_min <= 1:
                 verdict = "NO GAP ✅"
-            elif ws_closed_n > 0:
-                verdict = f"GAP PARTIALLY FILLED ✅ ({ws_closed_n} WS candles bridging REST lag)"
-            elif not got_tick:
-                verdict = "WAITING FOR WS TICK ⏳"
+            elif ws_closed_n == 0:
+                # Just subscribed — gap exists, will fill over time
+                verdict = f"GAP {total_gap_min}min — bot needs ~{total_gap_min} more minutes to fill (WS collecting)"
+            elif remain_gap <= 0:
+                verdict = "NO GAP ✅ (WS filled all missing candles)"
             else:
-                verdict = f"GAP {gap_min}min ⚠️ — shrinks as bot collects more WS candles"
+                verdict = f"FILLING: {ws_closed_n}/{total_gap_min} candles filled — {remain_gap}min remaining"
 
             data = {
                 "symbol":       sym,
