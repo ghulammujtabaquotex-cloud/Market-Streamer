@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, Link } from "wouter";
 import { useGetCandles, getGetCandlesQueryKey, useListInstruments } from "@workspace/api-client-react";
+import type { CandlesResponse } from "@workspace/api-client-react";
 import { Chart, type LiveCandleData } from "@/components/Chart";
-import { ArrowLeft, Activity, Clock, AlertCircle, Wifi, WifiOff } from "lucide-react";
+import { ArrowLeft, Activity, Clock, AlertCircle, Wifi, WifiOff, TrendingUp, Ban, CheckCircle2 } from "lucide-react";
 import { formatPrice, formatChange, formatPercent, cn } from "@/lib/utils";
 
 // ── Live WebSocket hook ─────────────────────────────────────────────────────
@@ -33,11 +34,9 @@ function useChartWs(symbol: string | undefined) {
           candle?: LiveCandleData;
         };
         if (msg.type === "tick" || msg.type === "candle") {
-          // Live open candle — highlight with live color
           if (msg.candle) setLiveCandle({ ...msg.candle, isClosed: false });
           if (msg.price != null) setLivePrice(msg.price);
         } else if (msg.type === "candle_closed" && msg.candle) {
-          // Candle just closed (period rolled) — update with standard closed colors
           setLiveCandle({ ...msg.candle, isClosed: true });
         }
       } catch {}
@@ -65,6 +64,45 @@ function useChartWs(symbol: string | undefined) {
   return { liveCandle, livePrice, connected };
 }
 
+// ── Gap Status Badge ─────────────────────────────────────────────────────────
+function GapBadge({ data }: { data: CandlesResponse }) {
+  const { gap_after_min, market_closed, tick_count, tick_candles_filled, gap_before_min } = data;
+
+  if (market_closed) {
+    return (
+      <div className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded bg-[#2a2e39] text-[#758696]" title={data.gap_status}>
+        <Ban className="h-3 w-3 flex-none" />
+        <span className="hidden md:inline tracking-wider font-bold">CLOSED</span>
+      </div>
+    );
+  }
+
+  if (gap_after_min <= 1) {
+    return (
+      <div
+        className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded bg-[#089981]/10 text-[#089981]"
+        title={`${tick_count} ticks · ${tick_candles_filled} candles filled · gap was ${gap_before_min}min`}
+      >
+        <CheckCircle2 className="h-3 w-3 flex-none" />
+        <span className="hidden md:inline tracking-wider font-bold">NO GAP</span>
+        {tick_candles_filled > 0 && (
+          <span className="hidden lg:inline text-[#089981]/70">+{tick_candles_filled}</span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded bg-[#f5a623]/10 text-[#f5a623]"
+      title={data.gap_status}
+    >
+      <TrendingUp className="h-3 w-3 flex-none animate-pulse" />
+      <span className="hidden md:inline tracking-wider font-bold">{gap_after_min}MIN GAP</span>
+    </div>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────
 export default function ChartView() {
   const { symbol } = useParams<{ symbol: string }>();
@@ -76,29 +114,21 @@ export default function ChartView() {
 
   const { liveCandle, livePrice, connected } = useChartWs(symbol);
 
-  // ── Fetch candles ONLY after the WS subscription is confirmed ─────────────
-  // This guarantees no stale cached data is ever shown before the live feed
-  // is established.  "staleTime: 0" forces a fresh REST call every time the
-  // chart is opened (even if the React Query cache already has data).
   const { data: candlesResponse, isLoading: candlesLoading, isError } = useGetCandles(
     { symbol: symbol ?? "" },
     {
       query: {
-        enabled:            !!symbol && connected,   // wait for WS first
-        queryKey:           getGetCandlesQueryKey({ symbol: symbol ?? "" }),
-        staleTime:          0,                        // always re-fetch
+        enabled:              !!symbol && connected,
+        queryKey:             getGetCandlesQueryKey({ symbol: symbol ?? "" }),
+        staleTime:            0,
         refetchOnWindowFocus: false,
-        // Refetch every 30s to bridge any lag between TradoWix REST and live WS.
-        // The Chart component skips setData if first/last/count unchanged.
-        refetchInterval:    30_000,
+        refetchInterval:      30_000,
       },
     },
   );
 
-  const hasCandles = (candlesResponse?.candles?.length ?? 0) > 0;
-  const displayPrice = livePrice ?? instrument?.currentPrice ?? null;
-
-  // Loading state: either waiting for WS connect, or waiting for REST after connect
+  const hasCandles    = (candlesResponse?.candles?.length ?? 0) > 0;
+  const displayPrice  = livePrice ?? instrument?.currentPrice ?? null;
   const isLoadingData = !connected || (connected && candlesLoading);
 
   return (
@@ -139,7 +169,7 @@ export default function ChartView() {
           )}
         </div>
 
-        <div className="flex items-center gap-5 flex-none">
+        <div className="flex items-center gap-3 flex-none">
           {instrument && (
             <>
               <div className="flex flex-col items-end font-mono">
@@ -163,7 +193,7 @@ export default function ChartView() {
                 </span>
               </div>
 
-              <div className="flex items-center gap-3 font-mono text-sm border-l border-[#2a2e39] pl-5">
+              <div className="flex items-center gap-3 font-mono text-sm border-l border-[#2a2e39] pl-3">
                 <div className="flex flex-col items-center">
                   <span className="text-[9px] text-[#758696] tracking-wider mb-0.5">TURBO</span>
                   <span className="text-[#2962ff] font-bold">{formatPercent(instrument.turboPayoutRate)}</span>
@@ -175,6 +205,13 @@ export default function ChartView() {
                 </div>
               </div>
             </>
+          )}
+
+          {/* Gap status */}
+          {candlesResponse && (
+            <div className="border-l border-[#2a2e39] pl-3">
+              <GapBadge data={candlesResponse} />
+            </div>
           )}
 
           {/* WS status */}
@@ -198,9 +235,52 @@ export default function ChartView() {
         </div>
       </header>
 
+      {/* ── Gap info bar (when data loaded) ── */}
+      {candlesResponse && !candlesResponse.market_closed && (
+        <div className="flex-none border-b border-[#2a2e39]/50 bg-[#1a1e2d] px-4 py-1.5 flex items-center gap-4 text-[10px] font-mono text-[#758696]">
+          <span className="flex items-center gap-1.5">
+            <span className="text-[#4a5568] uppercase tracking-wider">REST</span>
+            <span className="text-[#d1d4dc]">{candlesResponse.count - candlesResponse.tick_candles_filled}</span>
+          </span>
+          <span className="text-[#2a2e39]">·</span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[#4a5568] uppercase tracking-wider">Ticks</span>
+            <span className="text-[#d1d4dc]">{candlesResponse.tick_count.toLocaleString()}</span>
+          </span>
+          <span className="text-[#2a2e39]">·</span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[#4a5568] uppercase tracking-wider">Filled</span>
+            <span className={cn(
+              candlesResponse.tick_candles_filled > 0 ? "text-[#089981]" : "text-[#758696]"
+            )}>
+              {candlesResponse.tick_candles_filled} candles
+            </span>
+          </span>
+          <span className="text-[#2a2e39]">·</span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[#4a5568] uppercase tracking-wider">Gap</span>
+            <span className={cn(
+              candlesResponse.gap_before_min > 0 ? "text-[#f5a623]" : "text-[#758696]"
+            )}>
+              {candlesResponse.gap_before_min}m
+            </span>
+            <span className="text-[#758696]">→</span>
+            <span className={cn(
+              candlesResponse.gap_after_min <= 1 ? "text-[#089981]" : "text-[#f5a623]"
+            )}>
+              {candlesResponse.gap_after_min}m
+            </span>
+          </span>
+          <span className="text-[#2a2e39]">·</span>
+          <span className="flex-1 truncate text-[#d1d4dc]/60" title={candlesResponse.gap_status}>
+            {candlesResponse.gap_status}
+          </span>
+        </div>
+      )}
+
       {/* ── Chart area ── */}
       <main className="flex-1 relative overflow-hidden bg-[#131722]">
-        {/* Loading overlay — shown while connecting OR while waiting for first data */}
+        {/* Loading overlay */}
         {isLoadingData && !isError && (
           <div className="absolute inset-0 flex items-center justify-center bg-[#131722]/95 z-10">
             <div className="flex flex-col items-center gap-3">

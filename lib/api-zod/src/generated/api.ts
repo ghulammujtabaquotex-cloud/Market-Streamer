@@ -56,6 +56,12 @@ export const GetCandlesResponse = zod.object({
   "latest_t": zod.number().nullish(),
   "has_live_tick": zod.boolean(),
   "fetch_error": zod.string().nullish(),
+  "gap_before_min": zod.number().describe('Gap in minutes between last REST candle and now, before tick fill'),
+  "gap_after_min": zod.number().describe('Remaining gap in minutes after tick fill'),
+  "tick_count": zod.number().describe('Number of raw ticks fetched from tick API'),
+  "tick_candles_filled": zod.number().describe('Number of new 1-min candles assembled from ticks'),
+  "market_closed": zod.boolean().describe('True when gap is large and no new ticks exist (market genuinely closed)'),
+  "gap_status": zod.string().describe('Human-readable gap status e.g. NO GAP, MARKET CLOSED, FILLING'),
   "candles": zod.array(zod.object({
   "symbol": zod.string(),
   "timeframe": zod.number().describe('Timeframe in seconds (60 = 1min)'),

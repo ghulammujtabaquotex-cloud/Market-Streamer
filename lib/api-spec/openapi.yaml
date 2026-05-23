@@ -162,7 +162,7 @@ components:
 
     CandlesResponse:
       type: object
-      required: [symbol, timeframe, timeframe_label, count, candles, has_live_tick]
+      required: [symbol, timeframe, timeframe_label, count, candles, has_live_tick, gap_before_min, gap_after_min, tick_count, tick_candles_filled, market_closed, gap_status]
       properties:
         symbol:
           type: string
@@ -180,6 +180,24 @@ components:
           type: boolean
         fetch_error:
           type: ["string", "null"]
+        gap_before_min:
+          type: integer
+          description: Gap in minutes between last REST candle and now, before tick fill
+        gap_after_min:
+          type: integer
+          description: Remaining gap in minutes after tick fill
+        tick_count:
+          type: integer
+          description: Number of raw ticks fetched from tick API
+        tick_candles_filled:
+          type: integer
+          description: Number of new 1-min candles assembled from ticks
+        market_closed:
+          type: boolean
+          description: True when gap is large and no new ticks exist (market genuinely closed)
+        gap_status:
+          type: string
+          description: Human-readable gap status e.g. NO GAP, MARKET CLOSED, FILLING
         candles:
           type: array
           items:

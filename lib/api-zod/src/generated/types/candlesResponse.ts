@@ -19,5 +19,17 @@ export interface CandlesResponse {
   has_live_tick: boolean;
   /** @nullable */
   fetch_error?: string | null;
+  /** Gap in minutes between last REST candle and now, before tick fill */
+  gap_before_min: number;
+  /** Remaining gap in minutes after tick fill */
+  gap_after_min: number;
+  /** Number of raw ticks fetched from tick API */
+  tick_count: number;
+  /** Number of new 1-min candles assembled from ticks */
+  tick_candles_filled: number;
+  /** True when gap is large and no new ticks exist (market genuinely closed) */
+  market_closed: boolean;
+  /** Human-readable gap status e.g. NO GAP, MARKET CLOSED, FILLING */
+  gap_status: string;
   candles: Candle[];
 }
